@@ -2116,8 +2116,8 @@ impl SpaceState {
 
     /// Rebuild in-memory state for this space from the durable store, if any.
     /// Replays the proven prefix, snapshots the batch-start tree, loads the
-    /// persisted proof, then replays the un-proven tail. Asserts the rebuilt
-    /// root matches the changelog's recorded root.
+    /// persisted proof, then replays the tail. (Root-equality is verified by the
+    /// durability integration test; a runtime guard is a planned hardening step.)
     pub async fn rehydrate_from_store(&mut self) -> Result<(), ServerError> {
         let Some(persisted) = self
             .change_store

@@ -112,4 +112,12 @@ async fn server_state_survives_restart_via_sqlite() {
         restored.changelog.num_changes() >= 4,
         "expected the replayed inserts (plus the create-space change)"
     );
+    assert_eq!(
+        restored.changelog.proven_up_to, 4,
+        "persisted proven_up_to should be restored"
+    );
+    assert!(
+        restored.ff_proof.is_some(),
+        "persisted FF proof should be loaded on rehydrate"
+    );
 }
