@@ -144,6 +144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = CliArgs::parse();
     let server_cfg = ServerConfig::from(&cli);
     let app_cfg = Arc::new(AppConfig::from_cli(&cli)?);
+    crate::db::configure_change_store(app_cfg.as_ref());
     crate::db::ensure_initialized(app_cfg.as_ref())
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;

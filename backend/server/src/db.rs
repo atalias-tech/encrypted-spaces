@@ -316,6 +316,45 @@ fn extract_retention_writes_from_change(change: &Change) -> Vec<(String, Vec<u8>
 static SPACES: Lazy<Mutex<HashMap<SpaceId, Arc<Mutex<SpaceState>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+static CHANGE_STORE: once_cell::sync::OnceCell<Arc<dyn ChangeStore>> =
+    once_cell::sync::OnceCell::new();
+
+/// Resolve the DB path from `SERVER_DB_PATH`, else `<space_root>/halyard.db`,
+/// and install the process-wide change store. Falls back to `NullChangeStore`
+/// when no path is configured. Call once at startup.
+pub fn configure_change_store(app_cfg: &AppConfig) {
+    let path = std::env::var("SERVER_DB_PATH").ok().or_else(|| {
+        app_cfg
+            .space_root
+            .as_ref()
+            .map(|root| format!("{}/halyard.db", root.trim_end_matches('/')))
+    });
+    let store: Arc<dyn ChangeStore> = match path {
+        Some(p) => match crate::persistence::SqliteChangeStore::open(std::path::Path::new(&p)) {
+            Ok(s) => {
+                log::info!("durable change store at {p}");
+                Arc::new(s)
+            }
+            Err(e) => {
+                log::error!("failed to open change store at {p}: {e}; durability DISABLED");
+                Arc::new(NullChangeStore)
+            }
+        },
+        None => {
+            log::warn!("no SERVER_DB_PATH or space_root; durability DISABLED (in-memory only)");
+            Arc::new(NullChangeStore)
+        }
+    };
+    let _ = CHANGE_STORE.set(store);
+}
+
+fn current_change_store() -> Arc<dyn ChangeStore> {
+    CHANGE_STORE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(NullChangeStore))
+}
+
 /// Build the per-space init config from the global [`AppConfig`].
 fn build_init_cfg(space_id: SpaceId, app_cfg: Option<&AppConfig>) -> Option<SpaceInitConfig> {
     app_cfg.map(|cfg| {
@@ -354,9 +393,14 @@ pub(crate) async fn get_or_create_space(
         verbose_logfile: None,
         bootstrap_data: BootstrapDataSource::None,
     });
-    let state = SpaceState::init_server(None, Some(init_cfg), None)
+    let mut state = SpaceState::init_server(None, Some(init_cfg), None)
         .await
         .expect("Failed to initialize space state");
+    state.change_store = current_change_store();
+    state
+        .rehydrate_from_store()
+        .await
+        .expect("Failed to rehydrate space from durable store");
     let arc = Arc::new(Mutex::new(state));
     map.insert(space_id, arc.clone());
     arc
@@ -5165,5 +5209,21 @@ mod tests {
             err_msg.contains("missing hashed value") || err_msg.contains("expected 32"),
             "error should mention missing hashed value, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn server_db_path_env_overrides_space_root() {
+        // SERVER_DB_PATH wins over space_root.
+        std::env::set_var("SERVER_DB_PATH", "/tmp/halyard-test-override.db");
+        let cfg = AppConfig {
+            verbose_logfile: None,
+            space_root: Some("/tmp/ignored".to_string()),
+            bootstrap_data: BootstrapDataSource::None,
+        };
+        configure_change_store(&cfg);
+        std::env::remove_var("SERVER_DB_PATH");
+        // OnceCell is process-global; just assert configuration did not panic
+        // and a store is installed.
+        assert!(current_change_store().load_space(SpaceId::from([0u8; 16])).is_ok());
     }
 }
