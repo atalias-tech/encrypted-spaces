@@ -1,5 +1,6 @@
 use crate::app_config::{AppConfig, BootstrapDataSource, SpaceInitConfig};
 use crate::key_delivery::GroupKeyDeliverySlots;
+use crate::persistence::{ChangeStore, NullChangeStore};
 use base64::Engine as _;
 use encrypted_spaces_acl_types::{Action, ActionBody, ActionLeg};
 use encrypted_spaces_backend::internal_schemas::RETENTION_TABLE_NAME;
@@ -157,6 +158,9 @@ pub struct SpaceState {
     verbose_logfile: Option<String>,
     /// Per-space store mapping SHA-256 hashes to full values for hash-backed columns.
     pub hash_store: HashMap<[u8; 32], Vec<u8>>,
+    /// Durable store for accepted changes + FF proof checkpoints.
+    /// Defaults to a no-op; set to a SQLite store by `get_or_create_space`.
+    pub change_store: Arc<dyn ChangeStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -547,6 +551,7 @@ impl SpaceState {
             sigref_map: BTreeMap::new(),
             verbose_logfile,
             hash_store: HashMap::new(),
+            change_store: Arc::new(NullChangeStore),
         };
         let sid = new_server_state.space_id;
         if let Some(config) = &init_cfg {
@@ -2069,6 +2074,98 @@ impl SpaceState {
         self.collect_hashed_values_for_entries(&entries)
     }
 
+    /// Re-apply one already-validated change during rehydration. Mirrors the
+    /// post-validation core of `handle_change` but skips signature/timestamp
+    /// re-validation and proof generation.
+    async fn replay_one(&mut self, change: &Change, accepted_at: u64) -> Result<(), ServerError> {
+        let entry = &change.entry;
+        let auth = AuthContext::new(Some(entry.uid as i64), self.space_id);
+
+        let referenced = self.require_hashed_values_for_change(change)?;
+
+        let old_root = self.get_root_hash().await;
+        let applied = self
+            .do_query_with_pruned_merkle_tree(change, &auth)
+            .await
+            .map_err(|e| ServerError::Generic(format!("replay apply failed: {e}")))?
+            .ok_or_else(|| {
+                ServerError::Generic(
+                    "replay produced a no-op; a persisted change was unexpectedly empty".into(),
+                )
+            })?;
+        let pruned_merkle_tree = applied.pruned_merkle_tree;
+        let new_root = self.get_root_hash().await;
+
+        self.insert_referenced_hashed_values(&change.hashed_values, &referenced);
+        let response_hashed_values = self.collect_hashed_values_for_change(change);
+        let change_id =
+            self.changelog
+                .add_change(entry, &pruned_merkle_tree, &old_root, &new_root)?;
+        self.sigref_map.insert(entry.uid, change_id);
+        self.change_responses.push(ChangeResponse {
+            old_root,
+            new_root,
+            pruned_merkle_tree,
+            change_id,
+            rows_affected: rows_affected(entry),
+            accepted_at_server_time: accepted_at,
+            hashed_values: response_hashed_values,
+        });
+        Ok(())
+    }
+
+    /// Rebuild in-memory state for this space from the durable store, if any.
+    /// Replays the proven prefix, snapshots the batch-start tree, loads the
+    /// persisted proof, then replays the un-proven tail. Asserts the rebuilt
+    /// root matches the changelog's recorded root.
+    pub async fn rehydrate_from_store(&mut self) -> Result<(), ServerError> {
+        let Some(persisted) = self
+            .change_store
+            .load_space(self.space_id)
+            .map_err(|e| ServerError::Generic(format!("load_space failed: {e}")))?
+        else {
+            return Ok(()); // brand-new space; nothing persisted
+        };
+
+        let proven_up_to = persisted.proven_up_to;
+        for (idx, row) in persisted.changes.iter().enumerate() {
+            // Snapshot the tree at the batch boundary, mirroring handle_change.
+            if idx == proven_up_to {
+                self.tree_snapshot = self.db.snapshot();
+            }
+            let entry = ChangelogEntry::from_bytes(&row.entry_bytes)
+                .map_err(|e| ServerError::Generic(format!("decode entry: {e}")))?;
+            let hashed_values: HashedValues = postcard::from_bytes(&row.hashed_values_bytes)
+                .map_err(|e| ServerError::Generic(format!("decode hashed_values: {e}")))?;
+            let change = Change {
+                entry,
+                hashed_values,
+            };
+            self.replay_one(&change, row.accepted_at).await?;
+        }
+        // All changes proven (no tail): the boundary snapshot was never taken.
+        if proven_up_to >= persisted.changes.len() {
+            self.tree_snapshot = self.db.snapshot();
+        }
+
+        if let Some(proof_bytes) = persisted.ff_proof {
+            self.changelog.ff_proof = proof_bytes.clone();
+            self.changelog.proven_up_to = proven_up_to;
+            self.ff_proof = Some(FFProof::deserialize(&proof_bytes).map_err(|e| {
+                ServerError::Generic(format!("decode persisted FF proof: {e}"))
+            })?);
+        }
+
+        log::info!(
+            "space={} rehydrated: {} change(s), proven_up_to={}, root={}",
+            self.space_id,
+            self.changelog.num_changes(),
+            self.changelog.proven_up_to,
+            hex::encode(self.db.root_hash())
+        );
+        Ok(())
+    }
+
     pub async fn handle_change(
         &mut self,
         change: &Change,
@@ -2189,6 +2286,19 @@ impl SpaceState {
         // changes — no-op deletes return early above without appending.
         self.sigref_map.insert(entry.uid, change_id);
 
+        // Durable-on-accept: persist this change BEFORE acking the client.
+        let hashed_values_bytes = postcard::to_allocvec(&change.hashed_values)
+            .map_err(|e| ServerError::Generic(format!("serialize hashed_values: {e}")))?;
+        self.change_store
+            .append_change(
+                self.space_id,
+                change_id,
+                &entry.as_bytes(),
+                &hashed_values_bytes,
+                accepted_at_server_time,
+            )
+            .map_err(|e| ServerError::Generic(format!("persist change {change_id}: {e}")))?;
+
         let server_new_clc: [u8; 32] = self.changelog.current_root();
         log::debug!(
             "space={} add_change: change_id={} op={:?} entry_len={} new_clc={}",
@@ -2264,6 +2374,18 @@ impl SpaceState {
                     self.space_id, num_changes
                 ))
             })?);
+            self.change_store
+                .save_ff_proof(
+                    self.space_id,
+                    self.changelog.proven_up_to,
+                    &self.changelog.ff_proof,
+                )
+                .map_err(|e| {
+                    ServerError::Generic(format!(
+                        "space={} failed to persist FF proof at proven_up_to={}: {e}",
+                        self.space_id, self.changelog.proven_up_to
+                    ))
+                })?;
             log::info!(
                 "space={} FF proof updated, proven_up_to={}",
                 self.space_id,
