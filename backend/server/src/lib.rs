@@ -6,3 +6,4 @@ pub mod app_config;
 pub mod db;
 pub mod file_store;
 pub mod key_delivery;
+mod persistence;
