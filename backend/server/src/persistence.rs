@@ -6,7 +6,7 @@
 //! DB path is configured and in unrelated tests.
 
 use encrypted_spaces_backend::SpaceId;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -134,7 +134,7 @@ impl ChangeStore for SqliteChangeStore {
                 change_id,
                 entry,
                 hashed_values,
-                accepted_at as i64,
+                accepted_at as i64, // stored as i64; bitwise-identical round-trip back to u64
             ],
         )?;
         Ok(())
@@ -180,7 +180,7 @@ impl ChangeStore for SqliteChangeStore {
                 params![key.as_slice()],
                 |row| Ok((row.get::<_, i64>(0)? as usize, row.get::<_, Vec<u8>>(1)?)),
             )
-            .ok();
+            .optional()?;
 
         if rows.is_empty() && proof_row.is_none() {
             return Ok(None);
@@ -237,5 +237,17 @@ mod tests {
         store.append_change(sid, 1, b"x", b"y", 1).unwrap();
         store.save_ff_proof(sid, 1, b"p").unwrap();
         assert!(store.load_space(sid).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_space_returns_proof_without_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteChangeStore::open(&dir.path().join("test.db")).unwrap();
+        let sid = SpaceId::from([3u8; 16]);
+        store.save_ff_proof(sid, 5, b"only-proof").unwrap();
+        let loaded = store.load_space(sid).unwrap().unwrap();
+        assert!(loaded.changes.is_empty());
+        assert_eq!(loaded.proven_up_to, 5);
+        assert_eq!(loaded.ff_proof.unwrap(), b"only-proof");
     }
 }
