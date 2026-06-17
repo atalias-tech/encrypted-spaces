@@ -83,6 +83,23 @@ impl LocalTransport {
         self.fetch_my_key_delivery_calls
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Test-only handle to the in-process server state.
+    #[cfg(feature = "testing")]
+    pub fn server_state(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Mutex<encrypted_spaces_backend_server::db::SpaceState>> {
+        self.state.clone()
+    }
+
+    /// Test-only: swap the server's durable change store.
+    #[cfg(feature = "testing")]
+    pub async fn set_server_change_store(
+        &self,
+        store: std::sync::Arc<dyn encrypted_spaces_backend_server::persistence::ChangeStore>,
+    ) {
+        self.state.lock().await.change_store = store;
+    }
 }
 
 impl LocalTransport {
