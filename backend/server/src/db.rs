@@ -319,16 +319,22 @@ static SPACES: Lazy<Mutex<HashMap<SpaceId, Arc<Mutex<SpaceState>>>>> =
 static CHANGE_STORE: once_cell::sync::OnceCell<Arc<dyn ChangeStore>> =
     once_cell::sync::OnceCell::new();
 
+/// Resolve the durable DB path: explicit `SERVER_DB_PATH` wins, else
+/// `<space_root>/halyard.db`, else `None` (durability disabled).
+fn resolve_db_path(server_db_path: Option<String>, space_root: Option<&str>) -> Option<String> {
+    server_db_path.or_else(|| {
+        space_root.map(|root| format!("{}/halyard.db", root.trim_end_matches('/')))
+    })
+}
+
 /// Resolve the DB path from `SERVER_DB_PATH`, else `<space_root>/halyard.db`,
 /// and install the process-wide change store. Falls back to `NullChangeStore`
 /// when no path is configured. Call once at startup.
 pub fn configure_change_store(app_cfg: &AppConfig) {
-    let path = std::env::var("SERVER_DB_PATH").ok().or_else(|| {
-        app_cfg
-            .space_root
-            .as_ref()
-            .map(|root| format!("{}/halyard.db", root.trim_end_matches('/')))
-    });
+    let path = resolve_db_path(
+        std::env::var("SERVER_DB_PATH").ok(),
+        app_cfg.space_root.as_deref(),
+    );
     let store: Arc<dyn ChangeStore> = match path {
         Some(p) => match crate::persistence::SqliteChangeStore::open(std::path::Path::new(&p)) {
             Ok(s) => {
@@ -345,7 +351,9 @@ pub fn configure_change_store(app_cfg: &AppConfig) {
             Arc::new(NullChangeStore)
         }
     };
-    let _ = CHANGE_STORE.set(store);
+    if CHANGE_STORE.set(store).is_err() {
+        log::warn!("configure_change_store called more than once; ignoring later call");
+    }
 }
 
 fn current_change_store() -> Arc<dyn ChangeStore> {
@@ -5212,18 +5220,18 @@ mod tests {
     }
 
     #[test]
-    fn server_db_path_env_overrides_space_root() {
+    fn resolve_db_path_precedence() {
         // SERVER_DB_PATH wins over space_root.
-        std::env::set_var("SERVER_DB_PATH", "/tmp/halyard-test-override.db");
-        let cfg = AppConfig {
-            verbose_logfile: None,
-            space_root: Some("/tmp/ignored".to_string()),
-            bootstrap_data: BootstrapDataSource::None,
-        };
-        configure_change_store(&cfg);
-        std::env::remove_var("SERVER_DB_PATH");
-        // OnceCell is process-global; just assert configuration did not panic
-        // and a store is installed.
-        assert!(current_change_store().load_space(SpaceId::from([0u8; 16])).is_ok());
+        assert_eq!(
+            resolve_db_path(Some("/explicit/x.db".to_string()), Some("/root")),
+            Some("/explicit/x.db".to_string())
+        );
+        // Falls back to <space_root>/halyard.db, trimming a trailing slash.
+        assert_eq!(
+            resolve_db_path(None, Some("/root/")),
+            Some("/root/halyard.db".to_string())
+        );
+        // No path configured -> None (durability disabled).
+        assert_eq!(resolve_db_path(None, None), None);
     }
 }
