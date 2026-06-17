@@ -26,6 +26,7 @@ log = { workspace = true }
 merk = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
+rusqlite = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +35,9 @@ encrypted-spaces-backend = { workspace = true, features = ["merk"] }
 tokio = { workspace = true, features = ["signal", "net"] }
 tokio-rustls = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 # Passthrough features so the server can be built as:
