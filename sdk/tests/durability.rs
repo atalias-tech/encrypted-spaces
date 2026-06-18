@@ -120,4 +120,18 @@ async fn server_state_survives_restart_via_sqlite() {
         restored.ff_proof.is_some(),
         "persisted FF proof should be loaded on rehydrate"
     );
+
+    // Regression: rehydrate must restore the cached MMR head
+    // `proven_clc_state` alongside `proven_up_to`, not leave it `None`.
+    // The pre-fix code assigned `changelog.ff_proof` / `proven_up_to`
+    // directly (bypassing `set_ff_proof`), leaving `proven_clc_state ==
+    // None` while `proven_up_to == 4` -- an internally inconsistent state.
+    assert!(
+        restored.changelog.proven_clc_state().is_some(),
+        "rehydrate must restore proven_clc_state when proven_up_to > 0"
+    );
+    restored
+        .changelog
+        .validate_mmr_state()
+        .expect("rehydrated changelog must be internally consistent");
 }

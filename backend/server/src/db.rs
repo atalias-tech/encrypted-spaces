@@ -2201,11 +2201,19 @@ impl SpaceState {
         }
 
         if let Some(proof_bytes) = persisted.ff_proof {
-            self.changelog.ff_proof = proof_bytes.clone();
-            self.changelog.proven_up_to = proven_up_to;
+            // Restore via the supported boundary-advance path so the cached
+            // MMR head `proven_clc_state` and the FF inclusion-proof cache are
+            // rebuilt exactly as the live server had them. Direct field
+            // assignment would leave `proven_clc_state == None` while
+            // `proven_up_to > 0`, an internally-inconsistent state that
+            // `validate_mmr_state` rejects. A persisted FF proof always has
+            // `proven_up_to >= ff_batch_size >= 1`, and `self.changelog`'s
+            // `proven_up_to` is still 0 here (the replay loop above does not
+            // advance it), so `set_ff_proof`'s strict-advance assertion holds.
             self.ff_proof = Some(FFProof::deserialize(&proof_bytes).map_err(|e| {
                 ServerError::Generic(format!("decode persisted FF proof: {e}"))
             })?);
+            self.changelog.set_ff_proof(proof_bytes, proven_up_to);
         }
 
         log::info!(
