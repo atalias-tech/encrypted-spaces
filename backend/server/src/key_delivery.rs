@@ -75,12 +75,10 @@ pub(crate) async fn handle_fetch_my_key_delivery_request(
         }
     };
 
-    let slot = get_or_create_space(auth_context.space_id, Some(app_cfg))
-        .await
-        .lock()
-        .await
-        .key_delivery_slots
-        .get(uid);
+    let slot = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(space) => space.lock().await.key_delivery_slots.get(uid),
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
 
     let (has_delivery, payload) = match slot {
         Some(bytes) => (true, bytes),

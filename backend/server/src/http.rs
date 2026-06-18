@@ -132,7 +132,15 @@ async fn handle_file(
     };
 
     // Look up the space to get its file store
-    let space = crate::db::get_or_create_space(auth.space_id, Some(&app_cfg)).await;
+    let space = match crate::db::get_or_create_space(auth.space_id, Some(&app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("failed to load space: {e}")))
+                .unwrap())
+        }
+    };
     let file_store = {
         let srv = space.lock().await;
         match &srv.file_store {

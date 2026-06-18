@@ -42,6 +42,11 @@ pub struct PersistedSpace {
     pub ff_proof: Option<Vec<u8>>,
     /// The `proven_up_to` recorded with the proof (0 if no proof).
     pub proven_up_to: usize,
+    /// The post-change merk root recorded with the highest-`change_id` row,
+    /// or `None` when no changes are persisted. Used by the rehydrate root
+    /// guard to refuse serving a space whose replayed state diverges from
+    /// what was recorded.
+    pub last_root: Option<Vec<u8>>,
 }
 
 pub trait ChangeStore: Send + Sync {
@@ -52,6 +57,7 @@ pub trait ChangeStore: Send + Sync {
         entry: &[u8],
         hashed_values: &[u8],
         accepted_at: u64,
+        new_root: &[u8],
     ) -> Result<(), PersistError>;
 
     fn save_ff_proof(
@@ -75,6 +81,7 @@ impl ChangeStore for NullChangeStore {
         _: &[u8],
         _: &[u8],
         _: u64,
+        _: &[u8],
     ) -> Result<(), PersistError> {
         Ok(())
     }
@@ -102,6 +109,7 @@ impl SqliteChangeStore {
                  entry         BLOB    NOT NULL,
                  hashed_values BLOB    NOT NULL,
                  accepted_at   INTEGER NOT NULL,
+                 new_root      BLOB    NOT NULL,
                  PRIMARY KEY (space_id, change_id)
              );
              CREATE TABLE IF NOT EXISTS ff_proof (
@@ -124,17 +132,19 @@ impl ChangeStore for SqliteChangeStore {
         entry: &[u8],
         hashed_values: &[u8],
         accepted_at: u64,
+        new_root: &[u8],
     ) -> Result<(), PersistError> {
         let conn = self.conn.lock().expect("change store mutex poisoned");
         conn.execute(
-            "INSERT INTO changes (space_id, change_id, entry, hashed_values, accepted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO changes (space_id, change_id, entry, hashed_values, accepted_at, new_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 space_id.as_bytes().as_slice(),
                 change_id,
                 entry,
                 hashed_values,
                 accepted_at as i64, // stored as i64; bitwise-identical round-trip back to u64
+                new_root,
             ],
         )?;
         Ok(())
@@ -160,19 +170,28 @@ impl ChangeStore for SqliteChangeStore {
         let key = space_id.as_bytes().to_vec();
 
         let mut stmt = conn.prepare(
-            "SELECT change_id, entry, hashed_values, accepted_at
+            "SELECT change_id, entry, hashed_values, accepted_at, new_root
              FROM changes WHERE space_id = ?1 ORDER BY change_id ASC",
         )?;
-        let rows = stmt
+        // Collect rows alongside their recorded post-change roots; the
+        // highest-`change_id` row's root becomes `last_root` (the rows are
+        // ordered ascending, so it is the last element).
+        let rows_with_roots = stmt
             .query_map(params![key.as_slice()], |row| {
-                Ok(PersistedChangeRow {
-                    change_id: row.get::<_, i64>(0)? as u32,
-                    entry_bytes: row.get(1)?,
-                    hashed_values_bytes: row.get(2)?,
-                    accepted_at: row.get::<_, i64>(3)? as u64,
-                })
+                Ok((
+                    PersistedChangeRow {
+                        change_id: row.get::<_, i64>(0)? as u32,
+                        entry_bytes: row.get(1)?,
+                        hashed_values_bytes: row.get(2)?,
+                        accepted_at: row.get::<_, i64>(3)? as u64,
+                    },
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let last_root = rows_with_roots.last().map(|(_, root)| root.clone());
+        let rows: Vec<PersistedChangeRow> =
+            rows_with_roots.into_iter().map(|(row, _)| row).collect();
 
         let proof_row = conn
             .query_row(
@@ -193,6 +212,7 @@ impl ChangeStore for SqliteChangeStore {
             changes: rows,
             ff_proof,
             proven_up_to,
+            last_root,
         }))
     }
 }
@@ -208,10 +228,10 @@ mod tests {
         let sid = SpaceId::from([7u8; 16]);
 
         store
-            .append_change(sid, 1, b"entry1", b"hv1", 1000)
+            .append_change(sid, 1, b"entry1", b"hv1", 1000, &[0x11; 32])
             .unwrap();
         store
-            .append_change(sid, 2, b"entry2", b"hv2", 1001)
+            .append_change(sid, 2, b"entry2", b"hv2", 1001, &[0x22; 32])
             .unwrap();
         store.save_ff_proof(sid, 2, b"proofbytes").unwrap();
 
@@ -222,6 +242,8 @@ mod tests {
         assert_eq!(loaded.changes[1].hashed_values_bytes, b"hv2");
         assert_eq!(loaded.proven_up_to, 2);
         assert_eq!(loaded.ff_proof.unwrap(), b"proofbytes");
+        // `last_root` is the post-change root of the highest change_id (2).
+        assert_eq!(loaded.last_root.unwrap(), vec![0x22; 32]);
 
         // Unknown space → None.
         assert!(store
@@ -234,7 +256,9 @@ mod tests {
     fn null_store_persists_nothing() {
         let store = NullChangeStore;
         let sid = SpaceId::from([1u8; 16]);
-        store.append_change(sid, 1, b"x", b"y", 1).unwrap();
+        store
+            .append_change(sid, 1, b"x", b"y", 1, &[0u8; 32])
+            .unwrap();
         store.save_ff_proof(sid, 1, b"p").unwrap();
         assert!(store.load_space(sid).unwrap().is_none());
     }
@@ -249,5 +273,7 @@ mod tests {
         assert!(loaded.changes.is_empty());
         assert_eq!(loaded.proven_up_to, 5);
         assert_eq!(loaded.ff_proof.unwrap(), b"only-proof");
+        // No change rows → no recorded root.
+        assert!(loaded.last_root.is_none());
     }
 }

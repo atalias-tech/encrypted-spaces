@@ -388,11 +388,11 @@ fn build_init_cfg(space_id: SpaceId, app_cfg: Option<&AppConfig>) -> Option<Spac
 pub(crate) async fn get_or_create_space(
     space_id: SpaceId,
     app_cfg: Option<&AppConfig>,
-) -> Arc<Mutex<SpaceState>> {
+) -> Result<Arc<Mutex<SpaceState>>, ServerError> {
     let mut map = SPACES.lock().await;
 
     if let Some(existing) = map.get(&space_id) {
-        return existing.clone();
+        return Ok(existing.clone());
     }
 
     let init_cfg = build_init_cfg(space_id, app_cfg).unwrap_or(SpaceInitConfig {
@@ -405,13 +405,17 @@ pub(crate) async fn get_or_create_space(
         .await
         .expect("Failed to initialize space state");
     state.change_store = current_change_store();
-    state
-        .rehydrate_from_store()
-        .await
-        .expect("Failed to rehydrate space from durable store");
+    // Fail-soft per space: a rehydrate error (undecodable store or a root-guard
+    // mismatch) must not be cached or take down the process. Propagate it so the
+    // request for THIS space fails with an error response while other spaces keep
+    // working; the space is not inserted, so a later request can retry.
+    state.rehydrate_from_store().await.map_err(|e| {
+        log::error!("space={space_id} rehydrate failed; refusing to serve: {e}");
+        e
+    })?;
     let arc = Arc::new(Mutex::new(state));
     map.insert(space_id, arc.clone());
-    arc
+    Ok(arc)
 }
 
 /// Log how spaces will be initialized at startup.
@@ -2168,8 +2172,10 @@ impl SpaceState {
 
     /// Rebuild in-memory state for this space from the durable store, if any.
     /// Replays the proven prefix, snapshots the batch-start tree, loads the
-    /// persisted proof, then replays the tail. (Root-equality is verified by the
-    /// durability integration test; a runtime guard is a planned hardening step.)
+    /// persisted proof, then replays the tail. Finally a fail-loud root guard
+    /// (spec §5.5) compares the rebuilt merk root against the post-change root
+    /// recorded with the last persisted change and returns `Err` on mismatch,
+    /// so a corrupted/tampered store or a replay regression refuses to serve.
     pub async fn rehydrate_from_store(&mut self) -> Result<(), ServerError> {
         let Some(persisted) = self
             .change_store
@@ -2180,6 +2186,7 @@ impl SpaceState {
         };
 
         let proven_up_to = persisted.proven_up_to;
+        let expected_last_root = persisted.last_root.clone();
         for (idx, row) in persisted.changes.iter().enumerate() {
             // Snapshot the tree at the batch boundary, mirroring handle_change.
             if idx == proven_up_to {
@@ -2214,6 +2221,24 @@ impl SpaceState {
                 ServerError::Generic(format!("decode persisted FF proof: {e}"))
             })?);
             self.changelog.set_ff_proof(proof_bytes, proven_up_to);
+        }
+
+        // Fail-loud root guard (spec §5.5): the rebuilt merk root must match
+        // the post-change root recorded with the last persisted change. A
+        // mismatch means the on-disk changes were corrupted/tampered or the
+        // replay path regressed — either way the replayed state is not the one
+        // we acked, so refuse to serve this space.
+        if let Some(expected) = expected_last_root {
+            let actual = self.db.root_hash();
+            if expected.as_slice() != actual.as_slice() {
+                return Err(ServerError::Generic(format!(
+                    "space={} rehydrate root guard FAILED: recorded={} replayed={}; \
+                     refusing to serve divergent space",
+                    self.space_id,
+                    hex::encode(&expected),
+                    hex::encode(actual),
+                )));
+            }
         }
 
         log::info!(
@@ -2356,6 +2381,7 @@ impl SpaceState {
                 &entry.as_bytes(),
                 &hashed_values_bytes,
                 accepted_at_server_time,
+                &new_root,
             )
             .map_err(|e| ServerError::Generic(format!("persist change {change_id}: {e}")))?;
 
@@ -3345,11 +3371,13 @@ async fn process_request_directly(
 
     if opn != "Select" && opn != "FastForward" {
         let log_context = format!("After request of type {opn:?}, database is:");
-        get_or_create_space(auth_context.space_id, Some(&app_cfg))
-            .await
-            .lock()
-            .await
-            .log_server_state(&log_context);
+        match get_or_create_space(auth_context.space_id, Some(&app_cfg)).await {
+            Ok(space) => space.lock().await.log_server_state(&log_context),
+            Err(e) => log::error!(
+                "space={} post-request state log skipped; get_or_create_space failed: {e}",
+                auth_context.space_id
+            ),
+        }
     }
 
     response
@@ -3371,7 +3399,10 @@ async fn handle_select(
         auth_context.space_id
     );
 
-    let space = get_or_create_space(auth_context.space_id, Some(app_cfg)).await;
+    let space = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
     let result = space
         .lock()
         .await
@@ -3409,13 +3440,16 @@ async fn handle_change(
         hashed_values: proto::values_sidecar_from_proto(req.values_sidecar),
     };
 
-    match get_or_create_space(auth_context.space_id, Some(app_cfg))
-        .await
+    let space = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
+    let result = space
         .lock()
         .await
         .handle_change_with_proofs(&change, auth_context, retention_proofs)
-        .await
-    {
+        .await;
+    match result {
         Ok(change_response) => ok_response(
             request_id,
             db_response::Result::Change(proto::ChangeResponse::from(&change_response)),
@@ -3436,12 +3470,15 @@ async fn handle_fast_forward(
     let from_change_id = req.from_change_id;
     let expected_change_ids = req.expected_change_ids;
 
-    match get_or_create_space(auth_context.space_id, Some(app_cfg))
-        .await
+    let space = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
+    let result = space
         .lock()
         .await
-        .handle_fast_forward(from_change_id, &expected_change_ids, auth_context)
-    {
+        .handle_fast_forward(from_change_id, &expected_change_ids, auth_context);
+    match result {
         Ok(ff_data) => ok_response(
             request_id,
             db_response::Result::FastForward(proto::FastForwardResponse::from(&ff_data)),
@@ -3476,8 +3513,11 @@ async fn handle_add_member_request(
         hashed_values: proto::values_sidecar_from_proto(insert_change_req.values_sidecar),
     };
 
-    match get_or_create_space(auth_context.space_id, Some(app_cfg))
-        .await
+    let space = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
+    let result = space
         .lock()
         .await
         .handle_add_member(
@@ -3486,8 +3526,8 @@ async fn handle_add_member_request(
             auth_context,
             &req.retention_proofs,
         )
-        .await
-    {
+        .await;
+    match result {
         Ok(change_response) => ok_response(
             request_id,
             db_response::Result::AddMember(proto::AddMemberResponse {
@@ -3526,8 +3566,11 @@ async fn handle_remove_member_request(
         hashed_values: proto::values_sidecar_from_proto(delete_change_req.values_sidecar),
     };
 
-    match get_or_create_space(auth_context.space_id, Some(app_cfg))
-        .await
+    let space = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
+    let result = space
         .lock()
         .await
         .handle_remove_member(
@@ -3537,8 +3580,8 @@ async fn handle_remove_member_request(
             auth_context,
             &req.retention_proofs,
         )
-        .await
-    {
+        .await;
+    match result {
         Ok(change_response) => ok_response(
             request_id,
             db_response::Result::RemoveMember(proto::RemoveMemberResponse {
@@ -3583,8 +3626,11 @@ async fn handle_retention_request(
         hashed_values: proto::values_sidecar_from_proto(change_req.values_sidecar),
     };
 
-    match get_or_create_space(auth_context.space_id, Some(app_cfg))
-        .await
+    let space = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
+    let result = space
         .lock()
         .await
         .handle_retention(
@@ -3593,8 +3639,8 @@ async fn handle_retention_request(
             req.retention_proofs,
             rekey_request.as_ref(),
         )
-        .await
-    {
+        .await;
+    match result {
         Ok(change_response) => ok_response(
             request_id,
             db_response::Result::Retention(proto::RetentionResponse {
@@ -3971,8 +4017,8 @@ mod tests {
     #[tokio::test]
     async fn same_space_id_returns_same_arc() {
         let space_id = SpaceId::from([0xA1; 16]);
-        let arc1 = get_or_create_space(space_id, None).await;
-        let arc2 = get_or_create_space(space_id, None).await;
+        let arc1 = get_or_create_space(space_id, None).await.unwrap();
+        let arc2 = get_or_create_space(space_id, None).await.unwrap();
         assert!(Arc::ptr_eq(&arc1, &arc2));
     }
 
@@ -3980,8 +4026,8 @@ mod tests {
     async fn different_space_ids_return_different_arcs() {
         let id1 = SpaceId::from([0xA2; 16]);
         let id2 = SpaceId::from([0xA3; 16]);
-        let arc1 = get_or_create_space(id1, None).await;
-        let arc2 = get_or_create_space(id2, None).await;
+        let arc1 = get_or_create_space(id1, None).await.unwrap();
+        let arc2 = get_or_create_space(id2, None).await.unwrap();
         assert!(!Arc::ptr_eq(&arc1, &arc2));
     }
 
@@ -3989,8 +4035,8 @@ mod tests {
     async fn spaces_start_with_same_empty_root() {
         let id1 = SpaceId::from([0xA4; 16]);
         let id2 = SpaceId::from([0xA5; 16]);
-        let arc1 = get_or_create_space(id1, None).await;
-        let arc2 = get_or_create_space(id2, None).await;
+        let arc1 = get_or_create_space(id1, None).await.unwrap();
+        let arc2 = get_or_create_space(id2, None).await.unwrap();
         let root1 = arc1.lock().await.get_root_hash().await;
         let root2 = arc2.lock().await.get_root_hash().await;
         assert_eq!(root1, root2);
@@ -4013,6 +4059,8 @@ mod tests {
             get_or_create_space(space_id, Some(&app_cfg)),
             get_or_create_space(space_id, Some(&app_cfg)),
         );
+        let a = a.unwrap();
+        let b = b.unwrap();
 
         assert!(
             Arc::ptr_eq(&a, &b),

@@ -2510,6 +2510,7 @@ dependencies = [
  "native-tls",
  "prost 0.14.4",
  "rand 0.9.4",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

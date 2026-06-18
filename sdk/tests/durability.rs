@@ -135,3 +135,95 @@ async fn server_state_survives_restart_via_sqlite() {
         .validate_mmr_state()
         .expect("rehydrated changelog must be internally consistent");
 }
+
+/// Follow-up A (fail-loud root guard, spec §5.5): if a persisted change's
+/// recorded post-change root no longer matches the root rebuilt by replay
+/// — i.e. the on-disk store was corrupted or tampered — `rehydrate_from_store`
+/// must return `Err` rather than silently serving a divergent space.
+///
+/// We tamper `new_root` (leaving the change `entry` decodable) so replay
+/// succeeds end-to-end and only the root guard can catch the divergence.
+#[tokio::test]
+async fn rehydrate_root_guard_rejects_tampered_store() {
+    std::env::set_var("RISC0_DEV_MODE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("halyard.db");
+    let store: Arc<dyn ChangeStore> = Arc::new(SqliteChangeStore::open(&db_path).unwrap());
+
+    let schema = SchemaBuilder::new("items")
+        .column("id", ColumnType::Integer)
+        .plaintext_primary_key()
+        .column("label", ColumnType::String)
+        .unwrap()
+        .plaintext()
+        .build()
+        .unwrap();
+    let schemas = [schema.clone()];
+
+    // Stand up a live server and accept a few changes so real rows (with their
+    // correct post-change roots) land in the SQLite store.
+    let transport = LocalTransport::new(&schemas, None, Some(2)).await.unwrap();
+    transport.set_server_change_store(store.clone()).await;
+
+    let space_id = {
+        let server_root = transport.get_root_hash().await.unwrap();
+        let space = Space::create(
+            transport.clone(),
+            ApplicationSchema::for_testing(vec![schema.clone()], server_root),
+        )
+        .await
+        .unwrap();
+        let items = space.table::<serde_json::Value>("items");
+        for i in 0..4 {
+            items
+                .insert(&serde_json::json!({ "id": null, "label": format!("item-{i}") }))
+                .execute()
+                .await
+                .unwrap();
+        }
+        transport.server_state().lock().await.space_id
+    };
+
+    // Tamper the persisted post-change root for the highest change_id (the row
+    // whose `new_root` becomes `last_root`, the value the guard checks). The
+    // entry stays decodable, so replay reproduces the true final root, which
+    // now disagrees with the recorded (corrupted) one — exactly what the guard
+    // exists to catch.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE changes SET new_root = ?1
+                 WHERE space_id = ?2
+                   AND change_id = (SELECT MAX(change_id) FROM changes WHERE space_id = ?2)",
+                rusqlite::params![&[0xFFu8; 32][..], space_id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "expected to tamper exactly one persisted change row");
+    }
+
+    // A fresh server rehydrating from the tampered store must refuse to serve.
+    let mut restored = SpaceState::init_server(
+        Some(&schemas.to_vec()),
+        Some(SpaceInitConfig {
+            space_id,
+            artifact_path: None,
+            verbose_logfile: None,
+            bootstrap_data: BootstrapDataSource::None,
+        }),
+        Some(2),
+    )
+    .await
+    .unwrap();
+    restored.change_store = store.clone();
+
+    let err = restored
+        .rehydrate_from_store()
+        .await
+        .expect_err("tampered post-change root must fail the rehydrate root guard");
+    assert!(
+        err.to_string().contains("root guard"),
+        "expected a root-guard mismatch error, got: {err}"
+    );
+}
