@@ -118,6 +118,13 @@ impl SqliteChangeStore {
                  proof        BLOB    NOT NULL
              );",
         )?;
+        // Migrate older DBs created before the root-guard column existed.
+        let has_new_root: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('changes') WHERE name = 'new_root'")?
+            .exists([])?;
+        if !has_new_root {
+            conn.execute_batch("ALTER TABLE changes ADD COLUMN new_root BLOB")?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -185,11 +192,16 @@ impl ChangeStore for SqliteChangeStore {
                         hashed_values_bytes: row.get(2)?,
                         accepted_at: row.get::<_, i64>(3)? as u64,
                     },
-                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        let last_root = rows_with_roots.last().map(|(_, root)| root.clone());
+        // `new_root` is nullable for rows migrated from the old schema; scan
+        // from the end to find the most recent row that has a recorded root.
+        let last_root = rows_with_roots
+            .iter()
+            .rev()
+            .find_map(|(_, root)| root.clone());
         let rows: Vec<PersistedChangeRow> =
             rows_with_roots.into_iter().map(|(row, _)| row).collect();
 
@@ -250,6 +262,63 @@ mod tests {
             .load_space(SpaceId::from([9u8; 16]))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn migrates_old_schema_without_new_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("old.db");
+
+        // Create a DB with the old schema (no new_root column) and insert a row.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE changes (
+                     space_id      BLOB    NOT NULL,
+                     change_id     INTEGER NOT NULL,
+                     entry         BLOB    NOT NULL,
+                     hashed_values BLOB    NOT NULL,
+                     accepted_at   INTEGER NOT NULL,
+                     PRIMARY KEY (space_id, change_id)
+                 );
+                 CREATE TABLE ff_proof (
+                     space_id     BLOB    PRIMARY KEY,
+                     proven_up_to INTEGER NOT NULL,
+                     proof        BLOB    NOT NULL
+                 );",
+            )
+            .unwrap();
+            let sid = SpaceId::from([5u8; 16]);
+            conn.execute(
+                "INSERT INTO changes (space_id, change_id, entry, hashed_values, accepted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    sid.as_bytes().as_slice(),
+                    1i64,
+                    b"old-entry",
+                    b"old-hv",
+                    999i64
+                ],
+            )
+            .unwrap();
+        }
+
+        // Re-open via SqliteChangeStore::open — should migrate transparently.
+        let store = SqliteChangeStore::open(&db_path).unwrap();
+        let sid = SpaceId::from([5u8; 16]);
+
+        // Append a new change with new_root — must not fail.
+        store
+            .append_change(sid, 2, b"new-entry", b"new-hv", 1234, &[0u8; 32])
+            .unwrap();
+
+        // load_space must return both the migrated row and the new one.
+        let loaded = store.load_space(sid).unwrap().unwrap();
+        assert_eq!(loaded.changes.len(), 2);
+        assert_eq!(loaded.changes[0].change_id, 1);
+        assert_eq!(loaded.changes[1].change_id, 2);
+        // new_root for the new row is present; migrated row has NULL → last_root is the new one's.
+        assert_eq!(loaded.last_root.unwrap(), vec![0u8; 32]);
     }
 
     #[test]
