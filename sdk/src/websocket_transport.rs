@@ -93,6 +93,9 @@ pub struct WebSocketTransport {
     ws: RefCell<Option<web_sys::WebSocket>>,
     #[cfg(target_arch = "wasm32")]
     state: Rc<InnerState>,
+    // Signer hook for the auth handshake (set via Transport::set_signer).
+    // Uses std::sync::Mutex so set_signer stays a plain non-async fn.
+    signer: std::sync::Mutex<Option<crate::transport::Signer>>,
 }
 
 // Safety: wasm WebSocket isn't Send/Sync but we never share it across threads in wasm;
@@ -175,6 +178,7 @@ impl WebSocketTransport {
             auth_b64: tokio::sync::Mutex::new(None),
             file_client,
             ws_tls_connector,
+            signer: std::sync::Mutex::new(None),
         })
     }
 
@@ -271,6 +275,10 @@ impl WebSocketTransport {
                             }
                             Some(ws_frame::Payload::DbRequest(_)) => {
                                 log_debug!("read_loop: ignoring stray frame");
+                            }
+                            Some(ws_frame::Payload::ChallengeNonce(_))
+                            | Some(ws_frame::Payload::ChallengeResponse(_)) => {
+                                log_debug!("read_loop: ignoring challenge frame (handshake not yet implemented)");
                             }
                             None => log_debug!("read_loop: empty WsFrame payload"),
                         },
@@ -548,6 +556,7 @@ impl WebSocketTransport {
             url: url.to_string(),
             ws: RefCell::new(Some(ws)),
             state,
+            signer: std::sync::Mutex::new(None),
         })
     }
 
@@ -898,6 +907,10 @@ impl Transport for WebSocketTransport {
 
     fn subscribe_broadcasts(&self) -> Result<crate::transport::BroadcastReceiver> {
         Ok(self.bcast_tx.subscribe())
+    }
+
+    fn set_signer(&self, signer: crate::transport::Signer) {
+        *self.signer.lock().unwrap() = Some(signer);
     }
 
     async fn send_ephemeral(&self, uid: u32, kind: &str, payload: &[u8]) -> Result<()> {

@@ -10,6 +10,10 @@ use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use std::any::Any;
 use std::collections::HashMap;
 
+/// A callable that signs a byte slice and returns the signature bytes.
+/// Used by the transport layer during the auth handshake (Task 4+).
+pub type Signer = std::sync::Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
 /// Generic ephemeral event received from another user.
 /// The `kind` field discriminates the message type (e.g. "cursor", "typing");
 /// `payload` carries the application-defined body.
@@ -170,6 +174,10 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Download encrypted file data by content hash.
     async fn file_download(&self, hash: &str) -> Result<Vec<u8>>;
+
+    /// Register a signing function used during the auth handshake.
+    /// The default is a no-op; `WebSocketTransport` overrides this to store the signer.
+    fn set_signer(&self, _signer: Signer) {}
 }
 
 #[cfg(test)]
