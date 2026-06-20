@@ -1,6 +1,8 @@
 pub mod space_id;
 pub use space_id::SpaceId;
 
+pub mod auth_challenge;
+
 pub mod access_control;
 pub mod app_schema;
 pub mod error;
