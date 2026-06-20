@@ -233,12 +233,24 @@ message Ephemeral {
   bytes  payload = 3;
 }
 
+message ChallengeNonce {
+  bytes nonce = 1;
+  string domain_tag = 2;
+}
+
+message ChallengeResponse {
+  int64 uid = 1;
+  bytes signature = 2;
+}
+
 message WsFrame {
   oneof payload {
     DbRequest db_request = 1;
     DbResponse db_response = 2;
     Broadcast broadcast = 3;
     Ephemeral ephemeral = 7;
+    ChallengeNonce challenge_nonce = 8;
+    ChallengeResponse challenge_response = 9;
   }
 }
 
