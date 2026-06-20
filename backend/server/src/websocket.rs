@@ -2,9 +2,10 @@ use crate::app_config::AppConfig;
 use crate::db::{self, op_name};
 use crate::ShutdownRx;
 use encrypted_spaces_backend::access_control::AuthContext;
+use encrypted_spaces_backend::auth_challenge::auth_challenge_message;
 use encrypted_spaces_backend::proto::{
-    db_request, db_response, ws_frame, Broadcast as ProtoBroadcast, ChangeResponse, ChangelogEntry,
-    DbRequest, DbResponse, Ephemeral, WsFrame,
+    db_request, db_response, ws_frame, Broadcast as ProtoBroadcast, ChallengeNonce, ChangeResponse,
+    ChangelogEntry, DbRequest, DbResponse, Ephemeral, WsFrame,
 };
 use encrypted_spaces_backend::SpaceId;
 use futures_util::{SinkExt, StreamExt};
@@ -209,7 +210,9 @@ struct ConnectionState {
     /// broadcasting changes we just applied.
     connection_id: ConnectionId,
     app_cfg: Arc<AppConfig>,
-    auth: Arc<std::sync::Mutex<Option<AuthContext>>>,
+    /// uid proven via the WS challenge-response handshake at connect time, or
+    /// `None` for a bootstrap/unverified connection (Task 6 restricts these).
+    verified_uid: Option<i64>,
     /// Sends encoded frames directly back to this client (responses, notifications).
     response_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Connection registry for broadcasts.
@@ -218,11 +221,9 @@ struct ConnectionState {
 
 impl ConnectionState {
     fn auth_context(&self) -> AuthContext {
-        self.auth
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| AuthContext::anonymous(self.space_id))
+        // Build from the VERIFIED uid established during the handshake, never the
+        // client-asserted uid from the connection query string.
+        AuthContext::new(self.verified_uid, self.space_id)
     }
 }
 
@@ -280,6 +281,15 @@ async fn dispatch_frame(frame: WsFrame, state: &ConnectionState) {
         }
         Some(ws_frame::Payload::Ephemeral(e)) => {
             relay_ephemeral(&e, &state.conn_registry, state.space_id).await;
+        }
+        Some(ws_frame::Payload::ChallengeNonce(_))
+        | Some(ws_frame::Payload::ChallengeResponse(_)) => {
+            // The challenge handshake completes at connect, before this loop
+            // starts. Any challenge frame arriving here is stray; ignore it.
+            log::warn!(
+                "space={} ws: ignoring stray challenge frame (handshake already completed)",
+                state.space_id
+            );
         }
         None => {
             log::warn!(
@@ -442,6 +452,108 @@ async fn unregister_connection(registry: &ConnectionRegistry, space_id: SpaceId)
     log::debug!("ws: unregistered closed connections for space={space_id}");
 }
 
+/// Domain tag for the WS auth-challenge. Must match the client (Task 4).
+const AUTH_CHALLENGE_DOMAIN_TAG: &str = "halyard-auth-challenge-v1";
+
+/// The handshake decided the connection must be rejected (non-empty signature
+/// that failed to verify, or a malformed/absent response frame).
+struct HandshakeReject;
+
+/// Perform the server side of the WS challenge-response handshake on the freshly
+/// split sink/stream, before the read/write loops own them.
+///
+/// Sends a random `ChallengeNonce`, reads one `ChallengeResponse`, and returns:
+/// - `Ok(Some(uid))` — non-empty signature that verified against the user's
+///   `_users.auth_key`; the connection acts as that verified uid.
+/// - `Ok(None)` — bootstrap/unverified: empty signature, or the asserted uid
+///   has no auth key yet (brand-new space / user). Allowed to proceed; Task 6
+///   restricts what such a connection may do.
+/// - `Err(HandshakeReject)` — a non-empty signature that failed to verify, or a
+///   missing/malformed response. Caller closes the connection.
+async fn perform_auth_challenge(
+    write: &mut futures_util::stream::SplitSink<WsStream, Message>,
+    read: &mut futures_util::stream::SplitStream<WsStream>,
+    space_id: SpaceId,
+    app_cfg: &Arc<AppConfig>,
+) -> Result<Option<i64>, HandshakeReject> {
+    // 1. Generate a fresh 32-byte nonce and send it. `OsRng` is the fallible
+    // (`TryRngCore`) OS interface; a failure to draw OS entropy aborts the
+    // handshake rather than proceeding with a weak nonce.
+    let mut nonce = [0u8; 32];
+    if rand::TryRngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut nonce).is_err() {
+        log::error!("space={space_id} ws: failed to draw OS entropy for auth nonce");
+        return Err(HandshakeReject);
+    }
+    let challenge = WsFrame {
+        payload: Some(ws_frame::Payload::ChallengeNonce(ChallengeNonce {
+            nonce: nonce.to_vec(),
+            domain_tag: AUTH_CHALLENGE_DOMAIN_TAG.to_string(),
+        })),
+    };
+    if write
+        .send(Message::Binary(challenge.encode_to_vec()))
+        .await
+        .is_err()
+    {
+        return Err(HandshakeReject);
+    }
+
+    // 2. Read exactly one binary frame and decode the ChallengeResponse.
+    let resp = match read.next().await {
+        Some(Ok(m)) if m.is_binary() => match WsFrame::decode(&m.into_data()[..]) {
+            Ok(WsFrame {
+                payload: Some(ws_frame::Payload::ChallengeResponse(r)),
+            }) => r,
+            _ => {
+                log::warn!("space={space_id} ws: handshake response was not a ChallengeResponse");
+                return Err(HandshakeReject);
+            }
+        },
+        _ => {
+            log::warn!("space={space_id} ws: no usable handshake response frame");
+            return Err(HandshakeReject);
+        }
+    };
+
+    // 3. Empty signature => bootstrap/unverified connection.
+    if resp.signature.is_empty() {
+        return Ok(None);
+    }
+
+    // 4. Non-empty signature: verify against the user's _users.auth_key.
+    let space = match db::get_or_create_space(space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Can't load the space to look up the key; fail closed.
+            log::error!("space={space_id} ws: handshake could not load space: {e}");
+            return Err(HandshakeReject);
+        }
+    };
+    let guard = space.lock().await;
+    let message = auth_challenge_message(space_id, resp.uid, &nonce);
+    match guard.verify_auth_challenge(resp.uid, &message, &resp.signature) {
+        // Key exists and the signature verified: authenticated as this uid.
+        Ok(true) => Ok(Some(resp.uid)),
+        // Key exists but the signature does not match: reject.
+        Ok(false) => {
+            log::warn!(
+                "space={space_id} ws: handshake signature failed for uid={}",
+                resp.uid
+            );
+            Err(HandshakeReject)
+        }
+        // No auth key for this uid yet (brand-new user, e.g. before their
+        // CreateSpace lands): allowed to proceed unverified (bootstrap).
+        Err(e) => {
+            log::info!(
+                "space={space_id} ws: uid={} has no auth key yet; treating as bootstrap ({e})",
+                resp.uid
+            );
+            Ok(None)
+        }
+    }
+}
+
 pub async fn client_connected(
     ws: HyperWebsocket,
     app_cfg: Arc<AppConfig>,
@@ -450,24 +562,40 @@ pub async fn client_connected(
     space_id: SpaceId,
     shutdown_rx: ShutdownRx,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let uid = auth.as_ref().and_then(|a| a.uid);
-    let auth_ctx = auth.unwrap_or_else(|| AuthContext::anonymous(space_id));
+    // The uid the client *asserts* via the connection query string. It is only
+    // a hint for logging; the connection's effective uid is whatever the
+    // challenge-response handshake below actually verifies.
+    let asserted_uid = auth.as_ref().and_then(|a| a.uid);
     let ws_stream = ws.await?;
-    log::info!("space={space_id} ws: client connected uid={:?}", uid);
+    log::info!("space={space_id} ws: client connected asserted_uid={asserted_uid:?}");
 
-    let (write, read) = ws_stream.split();
+    let (mut write, mut read) = ws_stream.split();
+
+    // --- Auth challenge-response handshake (runs on the local split halves
+    // BEFORE the read/write loops take ownership of them) --------------------
+    let verified_uid =
+        match perform_auth_challenge(&mut write, &mut read, space_id, &app_cfg).await {
+            Ok(v) => v,
+            Err(HandshakeReject) => {
+                log::warn!("space={space_id} ws: auth handshake rejected, closing connection");
+                let _ = write.send(Message::Close(None)).await;
+                let _ = write.close().await;
+                return Ok(());
+            }
+        };
+    log::info!("space={space_id} ws: handshake complete verified_uid={verified_uid:?}");
+
     let (response_tx, response_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let auth = Arc::new(std::sync::Mutex::new(Some(auth_ctx.clone())));
-
+    let verified_ctx = AuthContext::new(verified_uid, space_id);
     let connection_id =
-        register_connection(&conn_registry, space_id, &auth_ctx, &response_tx).await;
+        register_connection(&conn_registry, space_id, &verified_ctx, &response_tx).await;
 
     let state = ConnectionState {
         space_id,
         connection_id,
         app_cfg,
-        auth: auth.clone(),
+        verified_uid,
         response_tx,
         conn_registry: conn_registry.clone(),
     };

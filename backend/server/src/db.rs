@@ -1179,6 +1179,29 @@ impl SpaceState {
         Self::decode_auth_verifying_key(auth_key_b64)
     }
 
+    /// Verify a WS auth-challenge response against the user's `_users.auth_key`.
+    ///
+    /// The three outcomes are kept distinct so the WS handler can decide policy:
+    /// - `Ok(true)`  — the user's auth key exists and `signature` verifies over
+    ///   `message`. The connection is authenticated as `uid`.
+    /// - `Ok(false)` — the user's auth key exists but `signature` does not
+    ///   verify. The handler MUST reject the connection.
+    /// - `Err(_)`    — no auth key for `uid` yet (unknown / brand-new user, e.g.
+    ///   before their CreateSpace lands). The handler treats this as a
+    ///   bootstrap/unverified connection (Task 6 restricts what it can do).
+    // `db` is compiled into both the lib and the bin; this is only called from
+    // the bin's `websocket` module, so the lib target sees it as unused.
+    #[allow(dead_code)]
+    pub(crate) fn verify_auth_challenge(
+        &self,
+        uid: i64,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, ServerError> {
+        let vk = self.user_table_verifying_key(uid as u32)?;
+        Ok(Ed25519Signature::verify(&vk, message, signature).is_ok())
+    }
+
     // Extract the signature key from the auth_key entry inside a CreateSpace
     // changelog entry. The signing key is fresh: there is no `_users` row
     // to look it up in yet, so we resolve it from the entry itself.

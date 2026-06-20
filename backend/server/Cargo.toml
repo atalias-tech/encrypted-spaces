@@ -26,6 +26,7 @@ log = { workspace = true }
 merk = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
+rand = { workspace = true, features = ["os_rng"] }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

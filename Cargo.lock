@@ -2234,6 +2234,7 @@ dependencies = [
  "once_cell",
  "postcard",
  "prost 0.14.4",
+ "rand 0.9.4",
  "rusqlite",
  "rustls 0.21.12",
  "rustls-pemfile",
