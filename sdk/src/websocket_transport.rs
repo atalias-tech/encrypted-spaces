@@ -2,12 +2,13 @@ use crate::transport::Transport;
 use base64::Engine;
 use encrypted_spaces_backend::{
     access_control::AuthContext,
+    auth_challenge::auth_challenge_message,
     error::{Result, SdkError},
     merk_storage::proofs::{verify_query_proof_with_hashed_values, VerifiedRows},
     proto::{
         db_request, db_response, values_sidecar_from_proto, values_sidecar_to_proto, ws_frame,
-        AddMemberRequest, ChangeRequest, DbRequest, DbResponse, Ephemeral, FastForwardRequest,
-        RemoveMemberRequest, SelectRequest, WsFrame,
+        AddMemberRequest, ChallengeResponse, ChangeRequest, DbRequest, DbResponse, Ephemeral,
+        FastForwardRequest, RemoveMemberRequest, SelectRequest, WsFrame,
     },
     query::Query,
     schema::Schema,
@@ -208,7 +209,55 @@ impl WebSocketTransport {
         }
         .map_err(|e| SdkError::DatabaseError(format!("connect ws failed: {e}")))?;
 
-        let (write, mut read) = stream.split();
+        let (mut write, mut read) = stream.split();
+
+        // Synchronous auth handshake on the raw split halves BEFORE the read
+        // loop is spawned (which moves `read`) and BEFORE `write` is stored:
+        // receive exactly one ChallengeNonce, sign it, and send exactly one
+        // ChallengeResponse. After this exchange `read`/`write` carry on to the
+        // normal request/response path untouched.
+        {
+            use async_tungstenite::tungstenite::Message;
+            use futures_util::SinkExt;
+
+            let first = read
+                .next()
+                .await
+                .ok_or_else(|| SdkError::DatabaseError("ws closed before challenge".into()))?
+                .map_err(|e| SdkError::DatabaseError(format!("ws recv challenge: {e}")))?;
+            let bytes = match first {
+                Message::Binary(b) => b,
+                _ => return Err(SdkError::DatabaseError("expected binary challenge".into())),
+            };
+            let frame = WsFrame::decode(&bytes[..])
+                .map_err(|e| SdkError::DatabaseError(format!("decode challenge: {e}")))?;
+            let nonce = match frame.payload {
+                Some(ws_frame::Payload::ChallengeNonce(c)) => c.nonce,
+                _ => return Err(SdkError::DatabaseError("expected challenge nonce".into())),
+            };
+
+            // Sign only when we have both a signer and a uid. Bootstrap/anonymous
+            // paths (e.g. CreateSpace) have neither, so send an empty signature
+            // and let the server's bootstrap path decide.
+            let resp = match (self.signer.lock().unwrap().clone(), auth_context.uid) {
+                (Some(signer), Some(uid)) => {
+                    let msg = auth_challenge_message(auth_context.space_id, uid, &nonce);
+                    let signature = signer(&msg);
+                    ChallengeResponse { uid, signature }
+                }
+                _ => ChallengeResponse {
+                    uid: auth_context.uid.unwrap_or(0),
+                    signature: vec![],
+                },
+            };
+            let resp_frame = WsFrame {
+                payload: Some(ws_frame::Payload::ChallengeResponse(resp)),
+            };
+            write
+                .send(Message::Binary(resp_frame.encode_to_vec()))
+                .await
+                .map_err(|e| SdkError::DatabaseError(format!("send challenge resp: {e}")))?;
+        }
 
         let pending_clone = self.pending.clone();
         let bcast_clone = self.bcast_tx.clone();
@@ -278,7 +327,7 @@ impl WebSocketTransport {
                             }
                             Some(ws_frame::Payload::ChallengeNonce(_))
                             | Some(ws_frame::Payload::ChallengeResponse(_)) => {
-                                log_debug!("read_loop: ignoring challenge frame (handshake not yet implemented)");
+                                log_debug!("read_loop: ignoring stray challenge frame (handshake already completed at connect)");
                             }
                             None => log_debug!("read_loop: empty WsFrame payload"),
                         },
