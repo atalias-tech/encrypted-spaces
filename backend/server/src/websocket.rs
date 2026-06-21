@@ -231,6 +231,14 @@ impl ConnectionState {
 // Frame dispatch (read loop)
 // ---------------------------------------------------------------------------
 
+/// A bootstrap connection is promoted to verified ONLY after a CreateSpace
+/// that genuinely succeeded. `"ok"` is success; `"error"` and
+/// `"fast_forward_required"` are NOT (the latter returns before the
+/// space-existence check, so it must not promote — auth-bypass guard).
+fn should_promote(status: &str) -> bool {
+    status == "ok"
+}
+
 /// Bootstrap classifier: returns the founder uid iff `op` is the one operation
 /// an *unverified* (bootstrap) connection is allowed to perform — a `Change`
 /// carrying a `CreateSpace` entry. The founder's auth key is introduced by the
@@ -318,7 +326,7 @@ async fn handle_db_request(db_msg: DbRequest, state: &mut ConnectionState) {
     // founder can keep operating on this same connection. Without this, the
     // founder creates the space then is locked out of every subsequent op.
     if let Some(uid) = founder_uid {
-        if resp.status != "error" {
+        if should_promote(&resp.status) {
             log::info!(
                 "space={} ws: promoting bootstrap connection to verified uid={} after CreateSpace",
                 state.space_id,
@@ -1068,5 +1076,89 @@ mod tests {
         // The other client should.
         let b = decode_broadcast(&rx2.try_recv().expect("other client gets broadcast"));
         assert_eq!(b.change_entry.as_ref().unwrap().uid, 42);
+    }
+
+    // ---------------------------------------------------------------
+    // should_promote
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn should_promote_ok_is_true() {
+        assert!(should_promote("ok"));
+    }
+
+    #[test]
+    fn should_promote_error_is_false() {
+        assert!(!should_promote("error"));
+    }
+
+    #[test]
+    fn should_promote_fast_forward_required_is_false() {
+        assert!(!should_promote("fast_forward_required"));
+    }
+
+    // ---------------------------------------------------------------
+    // create_space_founder_uid
+    // ---------------------------------------------------------------
+
+    fn make_create_space_op(uid: u32) -> Option<db_request::Operation> {
+        use encrypted_spaces_changelog_core::changelog::OpType;
+        Some(db_request::Operation::Change(ChangeRequest {
+            change: Some(ChangelogEntry {
+                uid,
+                message: Some(LogMessage {
+                    op_type: OpType::CreateSpace.as_u8() as u32,
+                    tree_path: vec![],
+                    entries: vec![],
+                }),
+                ..Default::default()
+            }),
+            values_sidecar: vec![],
+            retention_proofs: vec![],
+        }))
+    }
+
+    fn make_insert_op(uid: u32) -> Option<db_request::Operation> {
+        use encrypted_spaces_changelog_core::changelog::OpType;
+        Some(db_request::Operation::Change(ChangeRequest {
+            change: Some(ChangelogEntry {
+                uid,
+                message: Some(LogMessage {
+                    op_type: OpType::Insert.as_u8() as u32,
+                    tree_path: vec![],
+                    entries: vec![],
+                }),
+                ..Default::default()
+            }),
+            values_sidecar: vec![],
+            retention_proofs: vec![],
+        }))
+    }
+
+    #[test]
+    fn create_space_founder_uid_returns_uid_for_create_space() {
+        let op = make_create_space_op(1);
+        assert_eq!(create_space_founder_uid(&op), Some(1));
+    }
+
+    #[test]
+    fn create_space_founder_uid_returns_none_for_other_op_type() {
+        let op = make_insert_op(1);
+        assert!(create_space_founder_uid(&op).is_none());
+    }
+
+    #[test]
+    fn create_space_founder_uid_returns_none_for_non_change_op() {
+        use encrypted_spaces_backend::proto::SelectRequest;
+        let op = Some(db_request::Operation::Select(SelectRequest {
+            query: Some(make_query("docs")),
+            ..Default::default()
+        }));
+        assert!(create_space_founder_uid(&op).is_none());
+    }
+
+    #[test]
+    fn create_space_founder_uid_returns_none_for_none_op() {
+        assert!(create_space_founder_uid(&None).is_none());
     }
 }
