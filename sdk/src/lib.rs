@@ -251,12 +251,19 @@ impl Space {
         let mut insert_builder = space.users().insert(&user_record);
         insert_builder.take_pending_error()?;
 
-        // Register internal table schemas locally (tables are auto-created on the backend)
+        // Register internal table schemas locally (tables are auto-created on
+        // the backend). Registration is local-only; the cache-warming SELECTs
+        // that normally accompany `_users` / `_retention` init are deferred
+        // until *after* the bootstrap CreateSpace below, because over a real
+        // verified-auth transport the connection is unverified until CreateSpace
+        // promotes it — a SELECT issued first is rejected by the server's
+        // verified-connection gate. (`LocalTransport` auto-verifies, so this
+        // ordering was previously invisible.)
         space.register_table_schema(access_control_schema());
         space.initialize_key_history();
         space.initialize_lists();
-        space.initialize_users().await?;
-        space.initialize_retention().await?;
+        space.register_users_schema();
+        space.register_retention_schema();
 
         crate::crypto::encrypt_query_fields(&mut insert_builder.query, &space).await?;
         let change = {
@@ -270,6 +277,11 @@ impl Space {
             .transport
             .submit_change(&change, create_proofs)
             .await?;
+
+        // The CreateSpace above promoted the connection to verified; the
+        // deferred cache-warming SELECTs are now allowed.
+        space.warm_users_cache().await?;
+        space.warm_retention_cache().await?;
 
         let writes = space.validate_and_apply_change(&change.entry, &change_response)?;
         crate::cache::update_cache_from_proven_writes(&space, &change, &writes).await;

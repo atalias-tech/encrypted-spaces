@@ -39,8 +39,23 @@ fn deserialize_blob_from_b64<'de, D: serde::Deserializer<'de>>(
 
 impl Space {
     pub(crate) async fn initialize_retention(&self) -> Result<()> {
+        self.register_retention_schema();
+        self.warm_retention_cache().await
+    }
+
+    /// Register the built-in `_retention` schema locally (no network I/O).
+    ///
+    /// See [`Space::register_users_schema`] for why `Space::create` registers
+    /// internal schemas before submitting the bootstrap `CreateSpace` but
+    /// defers the cache-warming SELECTs until the connection is verified.
+    pub(crate) fn register_retention_schema(&self) {
         self.register_table_schema(retention_schema());
-        // Warm the cache so that subsequent indexed lookups are served locally.
+    }
+
+    /// Warm the `_retention` read cache so subsequent indexed lookups are
+    /// served locally. Issues a SELECT, so it must run on a verified
+    /// connection.
+    pub(crate) async fn warm_retention_cache(&self) -> Result<()> {
         let _: Vec<RetentionRecord> = self.retention_table().select().all().await?;
         Ok(())
     }

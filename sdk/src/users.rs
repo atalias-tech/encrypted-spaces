@@ -221,11 +221,25 @@ pub(crate) use encrypted_spaces_backend::internal_schemas::USERS_TABLE_NAME;
 
 impl Space {
     pub(crate) async fn initialize_users(&self) -> Result<(), SdkError> {
+        self.register_users_schema();
+        self.warm_users_cache().await
+    }
+
+    /// Register the built-in `_users` schema locally (no network I/O).
+    ///
+    /// Split out from [`Self::initialize_users`] so `Space::create` can
+    /// register the schema *before* the bootstrap `CreateSpace` is submitted
+    /// (the schema is needed to build the founder-insert change) while
+    /// deferring the cache-warming SELECT — a gated op — until *after* that
+    /// CreateSpace promotes the connection to verified.
+    pub(crate) fn register_users_schema(&self) {
         self.register_table_schema(users_schema());
+    }
 
-        // Warm users cache
+    /// Warm the `_users` read cache. Issues a SELECT, so it must run on a
+    /// verified connection.
+    pub(crate) async fn warm_users_cache(&self) -> Result<(), SdkError> {
         self.users().select().all().await?;
-
         Ok(())
     }
 

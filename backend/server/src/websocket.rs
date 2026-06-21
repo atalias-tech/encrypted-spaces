@@ -32,7 +32,12 @@ fn next_connection_id() -> ConnectionId {
 }
 
 /// A single client connection within a space.
-pub(crate) struct ClientConnection {
+///
+/// `pub` (with private fields) so the `ConnectionRegistry` alias — returned by
+/// `new_connection_registry` and accepted by `handle_request` — is nameable
+/// from library consumers (e.g. the SDK's WS integration tests). The fields
+/// stay private; the type is opaque to callers.
+pub struct ClientConnection {
     id: ConnectionId,
     sender: mpsc::UnboundedSender<Vec<u8>>,
 }
