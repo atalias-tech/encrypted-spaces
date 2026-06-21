@@ -231,7 +231,40 @@ impl ConnectionState {
 // Frame dispatch (read loop)
 // ---------------------------------------------------------------------------
 
-async fn handle_db_request(db_msg: DbRequest, state: &ConnectionState) {
+/// Bootstrap classifier: returns the founder uid iff `op` is the one operation
+/// an *unverified* (bootstrap) connection is allowed to perform — a `Change`
+/// carrying a `CreateSpace` entry. The founder's auth key is introduced by the
+/// CreateSpace change itself, so it cannot be in `_users` at handshake time;
+/// such a connection is therefore unverified and may do nothing else.
+///
+/// The returned uid is the change's `entry.uid` (the founder, uid 1). Trusting
+/// it here is safe: `handle_change` verifies the CreateSpace signature against
+/// the auth key embedded *in the change* (`create_space_verifying_key`), so a
+/// forged `entry.uid` cannot pass — and once the change lands, that key is the
+/// one bound to the uid in `_users`.
+///
+/// JOIN is intentionally NOT bootstrap: the inviter's `InviteUser` change
+/// registers the invitee's provisional `auth_key` in `_users` *before* the
+/// invite is handed off, so the invitee's handshake verifies and their
+/// connection arrives already verified (FetchMyKeyDelivery / RefreshKeys run on
+/// a verified connection).
+fn create_space_founder_uid(op: &Option<db_request::Operation>) -> Option<i64> {
+    use encrypted_spaces_changelog_core::changelog::OpType;
+    match op {
+        Some(db_request::Operation::Change(req)) => {
+            let entry = req.change.as_ref()?;
+            let message = entry.message.as_ref()?;
+            if message.op_type == OpType::CreateSpace.as_u8() as u32 {
+                Some(entry.uid as i64)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn handle_db_request(db_msg: DbRequest, state: &mut ConnectionState) {
     let opn = op_name(&db_msg.operation);
     log::debug!(
         "ws: decoded DbRequest request_id={} op={}",
@@ -239,9 +272,61 @@ async fn handle_db_request(db_msg: DbRequest, state: &ConnectionState) {
         opn
     );
 
+    // Verified-connection gate (Task 6). An unverified/bootstrap connection
+    // (`verified_uid == None`) may perform ONLY the bootstrap operation —
+    // CreateSpace — and nothing else. Every other op is rejected with an auth
+    // error before it ever reaches `db::dispatch`.
+    let request_id = db_msg.request_id.clone();
+    let founder_uid = if state.verified_uid.is_none() {
+        match create_space_founder_uid(&db_msg.operation) {
+            Some(uid) => Some(uid),
+            None => {
+                log::warn!(
+                    "space={} ws: rejecting op={} on unverified connection (not bootstrap)",
+                    state.space_id,
+                    opn
+                );
+                let resp = db::error_response(
+                    &request_id,
+                    "unverified_connection: this operation requires a verified connection",
+                );
+                send_direct_response(
+                    ws_frame::Payload::DbResponse(resp),
+                    &state.response_tx,
+                    state.space_id,
+                    "db",
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let operation_snapshot = db_msg.operation.clone();
-    let auth = state.auth_context();
+    // Verified connections dispatch as the verified uid. A bootstrap CreateSpace
+    // dispatches as the founder uid carried by the change, so `handle_change`'s
+    // `auth.uid == entry.uid` check passes (the change's signature is still
+    // verified against the auth key embedded in the change).
+    let auth = match founder_uid {
+        Some(uid) => AuthContext::new(Some(uid), state.space_id),
+        None => state.auth_context(),
+    };
     let mut resp = db::dispatch(db_msg, (*state.app_cfg).clone(), auth).await;
+
+    // Promote the bootstrap connection after a successful CreateSpace so the
+    // founder can keep operating on this same connection. Without this, the
+    // founder creates the space then is locked out of every subsequent op.
+    if let Some(uid) = founder_uid {
+        if resp.status != "error" {
+            log::info!(
+                "space={} ws: promoting bootstrap connection to verified uid={} after CreateSpace",
+                state.space_id,
+                uid
+            );
+            state.verified_uid = Some(uid);
+        }
+    }
 
     if let Some(bcast) = extract_broadcast_data(&operation_snapshot, &resp.result) {
         send_broadcast(
@@ -262,7 +347,7 @@ async fn handle_db_request(db_msg: DbRequest, state: &ConnectionState) {
     );
 }
 
-async fn dispatch_frame(frame: WsFrame, state: &ConnectionState) {
+async fn dispatch_frame(frame: WsFrame, state: &mut ConnectionState) {
     match frame.payload {
         Some(ws_frame::Payload::DbRequest(db_msg)) => {
             handle_db_request(db_msg, state).await;
@@ -306,7 +391,7 @@ async fn dispatch_frame(frame: WsFrame, state: &ConnectionState) {
 
 async fn run_read_loop(
     mut read: futures_util::stream::SplitStream<WsStream>,
-    state: ConnectionState,
+    mut state: ConnectionState,
     mut shutdown_rx: ShutdownRx,
 ) {
     loop {
@@ -331,7 +416,7 @@ async fn run_read_loop(
                         let data = m.into_data();
                         log::debug!("ws: inbound binary len={}B", data.len());
                         match WsFrame::decode(&data[..]) {
-                            Ok(frame) => dispatch_frame(frame, &state).await,
+                            Ok(frame) => dispatch_frame(frame, &mut state).await,
                             Err(e) => {
                                 log::warn!(
                                     "space={} ws: failed to decode WsFrame err={e}",
