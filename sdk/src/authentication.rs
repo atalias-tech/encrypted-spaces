@@ -48,8 +48,6 @@ impl Space {
 
 impl UserWithSecrets {
     /// Generates an [`AuthContext`] for a given user.
-    ///
-    /// TODO: Utilize the user's auth key to properly authenticate with the space.
     pub(crate) fn as_auth_context(&self, space_id: SpaceId) -> AuthContext {
         AuthContext::new(self.id, space_id)
     }

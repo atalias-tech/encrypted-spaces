@@ -209,6 +209,12 @@ impl Space {
 
         let space_id = SpaceId::random();
         let auth_context = user.as_auth_context(space_id);
+        {
+            let kp = user.auth_key_pair.clone();
+            transport.set_signer(std::sync::Arc::new(move |msg: &[u8]| {
+                kp.sign(msg).as_ref().to_vec()
+            }));
+        }
         transport.authenticate(&auth_context).await?;
 
         let space = Self {
@@ -292,6 +298,12 @@ impl Space {
     ) -> Result<Self> {
         let transport: Arc<dyn Transport> = Arc::new(transport);
         let auth_context = invite.user.as_auth_context(invite.space_id);
+        {
+            let kp = invite.user.auth_key_pair.clone();
+            transport.set_signer(std::sync::Arc::new(move |msg: &[u8]| {
+                kp.sign(msg).as_ref().to_vec()
+            }));
+        }
         transport.authenticate(&auth_context).await?;
 
         // Fetch the bootstrap envelope from the GK delivery slot deposited

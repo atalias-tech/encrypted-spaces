@@ -572,6 +572,12 @@ impl Space {
             km.set_update_key_pair(fresh_user.update_key_pair.clone());
             km.set_auth_key_pair(fresh_user.auth_key_pair.clone());
         }
+        {
+            let kp = fresh_user.auth_key_pair.clone();
+            self.transport.set_signer(std::sync::Arc::new(move |msg: &[u8]| {
+                kp.sign(msg).as_ref().to_vec()
+            }));
+        }
 
         Ok(fresh_user)
     }

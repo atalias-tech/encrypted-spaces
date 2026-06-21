@@ -249,6 +249,12 @@ impl Space {
         })?;
 
         let transport: std::sync::Arc<dyn Transport> = std::sync::Arc::new(transport);
+        {
+            let kp = key_manager.auth_key_pair().clone();
+            transport.set_signer(std::sync::Arc::new(move |msg: &[u8]| {
+                kp.sign(msg).as_ref().to_vec()
+            }));
+        }
         Self::restore_internal(transport, space_id, snapshot.state, key_manager).await
     }
 
