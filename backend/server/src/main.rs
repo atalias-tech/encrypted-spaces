@@ -1,4 +1,5 @@
 mod app_config;
+mod conn_limiter;
 mod db;
 pub(crate) mod file_store;
 mod http;
@@ -155,6 +156,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // bind failure (e.g. port already in use) returns an error from `main`
     // immediately instead of being swallowed when the runtime tries to wait
     // for the blocking stdin thread on shutdown.
+    let limiter = conn_limiter::ConnLimiter::new(server_cfg.max_conns_per_ip, server_cfg.max_conns_global);
+
     if let Some((cert_path, key_path)) = server_cfg.tls_config() {
         let bind_addr = SocketAddr::new(server_cfg.bind_host, server_cfg.tls_port);
         let listener = TcpListener::bind(bind_addr)
@@ -169,6 +172,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             app_cfg,
             registry,
             shutdown_rx,
+            limiter,
         )
         .await?;
     } else {
@@ -178,7 +182,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listener.set_nonblocking(true)?;
         println!("Listening on http://{bind_addr}");
         spawn_console_command_loop(app_cfg.clone());
-        run_http_server(listener, app_cfg, registry, shutdown_rx).await?;
+        run_http_server(listener, app_cfg, registry, shutdown_rx, limiter).await?;
     }
 
     // Both accept loops have exited; drop the per-space state so the
@@ -197,6 +201,7 @@ async fn run_tls_server(
     app_cfg: Arc<AppConfig>,
     registry: websocket::ConnectionRegistry,
     mut shutdown_rx: ShutdownRx,
+    limiter: conn_limiter::ConnLimiter,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls_cfg = tls::build_tls_config(cert_path, key_path)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
@@ -214,10 +219,18 @@ async fn run_tls_server(
                 break;
             }
             accept = listener.accept() => {
-                let (tcp, _) = match accept {
+                let (tcp, peer) = match accept {
                     Ok(pair) => pair,
                     Err(e) => {
                         log::warn!("TLS accept error (continuing): {e}");
+                        continue;
+                    }
+                };
+                let permit = match limiter.try_acquire(peer.ip()) {
+                    Some(p) => p,
+                    None => {
+                        log::warn!("connection rejected (limit) peer={}", peer.ip());
+                        drop(tcp);
                         continue;
                     }
                 };
@@ -226,6 +239,7 @@ async fn run_tls_server(
                 let reg_conn = registry.clone();
                 let conn_shutdown = shutdown_rx.clone();
                 tasks.spawn(async move {
+                    let _permit = permit;
                     match acceptor.accept(tcp).await {
                         Ok(tls_stream) => {
                             if let Err(err) = hyper::server::conn::Http::new()
@@ -267,6 +281,7 @@ async fn run_http_server(
     app_cfg: Arc<AppConfig>,
     registry: websocket::ConnectionRegistry,
     mut shutdown_rx: ShutdownRx,
+    limiter: conn_limiter::ConnLimiter,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Mirror the TLS path: accept connections manually and serve them
     // with `Http::serve_connection` so the accept loop exits as soon as
@@ -299,10 +314,18 @@ async fn run_http_server(
                 break;
             }
             accept = listener.accept() => {
-                let (tcp, _) = match accept {
+                let (tcp, peer) = match accept {
                     Ok(pair) => pair,
                     Err(e) => {
                         log::warn!("HTTP accept error (continuing): {e}");
+                        continue;
+                    }
+                };
+                let permit = match limiter.try_acquire(peer.ip()) {
+                    Some(p) => p,
+                    None => {
+                        log::warn!("connection rejected (limit) peer={}", peer.ip());
+                        drop(tcp);
                         continue;
                     }
                 };
@@ -310,6 +333,7 @@ async fn run_http_server(
                 let reg_conn = registry.clone();
                 let conn_shutdown = shutdown_rx.clone();
                 tasks.spawn(async move {
+                    let _permit = permit;
                     if let Err(err) = hyper::server::conn::Http::new()
                         .http1_only(true)
                         .http1_keep_alive(true)

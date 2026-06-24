@@ -38,6 +38,22 @@ pub struct CliArgs {
     /// Path to the TLS private key file (PEM).
     #[arg(long = "tls-key", env = "TLS_KEY_PATH")]
     pub tls_key: Option<String>,
+
+    /// Maximum concurrent connections from a single peer IP (direct exposure).
+    #[arg(
+        long = "max-conns-per-ip",
+        env = "MAX_CONNS_PER_IP",
+        default_value_t = 32
+    )]
+    pub max_conns_per_ip: u32,
+
+    /// Maximum concurrent connections across all peers.
+    #[arg(
+        long = "max-conns-global",
+        env = "MAX_CONNS_GLOBAL",
+        default_value_t = 4096
+    )]
+    pub max_conns_global: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +66,8 @@ pub struct ServerConfig {
     pub tls_port: u16,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    pub max_conns_per_ip: u32,
+    pub max_conns_global: usize,
 }
 
 impl ServerConfig {
@@ -69,6 +87,8 @@ impl From<&CliArgs> for ServerConfig {
             tls_port: args.tls_port,
             tls_cert: args.tls_cert.clone(),
             tls_key: args.tls_key.clone(),
+            max_conns_per_ip: args.max_conns_per_ip,
+            max_conns_global: args.max_conns_global,
         }
     }
 }
