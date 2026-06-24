@@ -15,7 +15,12 @@ use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// A connection that upgrades but never completes the auth handshake must
+/// not hold a task open forever (pre-auth slow-loris). Bound the wait.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type WsStream = hyper_tungstenite::WebSocketStream<hyper::upgrade::Upgraded>;
 
@@ -597,8 +602,8 @@ async fn perform_auth_challenge(
     }
 
     // 2. Read exactly one binary frame and decode the ChallengeResponse.
-    let resp = match read.next().await {
-        Some(Ok(m)) if m.is_binary() => match WsFrame::decode(&m.into_data()[..]) {
+    let resp = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read.next()).await {
+        Ok(Some(Ok(m))) if m.is_binary() => match WsFrame::decode(&m.into_data()[..]) {
             Ok(WsFrame {
                 payload: Some(ws_frame::Payload::ChallengeResponse(r)),
             }) => r,
@@ -607,8 +612,15 @@ async fn perform_auth_challenge(
                 return Err(HandshakeReject);
             }
         },
-        _ => {
+        Ok(_) => {
             log::warn!("space={space_id} ws: no usable handshake response frame");
+            return Err(HandshakeReject);
+        }
+        Err(_elapsed) => {
+            log::warn!(
+                "space={space_id} ws: auth handshake timed out after {:?}; closing",
+                HANDSHAKE_TIMEOUT
+            );
             return Err(HandshakeReject);
         }
     };

@@ -7,8 +7,31 @@ use encrypted_spaces_backend::access_control::AuthContext;
 use encrypted_spaces_backend::SpaceId;
 use hyper::body::Bytes;
 use hyper::{Body, Request, Response, StatusCode};
+use hyper_tungstenite::tungstenite::protocol::WebSocketConfig;
 use hyper_tungstenite::{is_upgrade_request, upgrade};
 use std::{convert::Infallible, sync::Arc};
+
+/// Cap inbound WebSocket frames/messages to bound memory per connection.
+/// 16 MiB is well above a legitimate WsFrame / file chunk and far below
+/// memory-exhaustion territory. Enforced by tungstenite on every read,
+/// including the pre-auth handshake frame.
+pub(crate) fn ws_config() -> WebSocketConfig {
+    let mut c = WebSocketConfig::default();
+    c.max_message_size = Some(16 * 1024 * 1024);
+    c.max_frame_size = Some(16 * 1024 * 1024);
+    c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ws_config_caps_message_size() {
+        let c = ws_config();
+        assert_eq!(c.max_message_size, Some(16 * 1024 * 1024));
+        assert_eq!(c.max_frame_size, Some(16 * 1024 * 1024));
+    }
+}
 
 pub async fn handle_request(
     req: Request<Body>,
@@ -43,7 +66,7 @@ pub async fn handle_request(
             }
         };
 
-        match upgrade(req, None) {
+        match upgrade(req, Some(ws_config())) {
             Ok((response, websocket)) => {
                 let app_cfg2 = app_cfg.clone();
                 let reg2 = registry.clone();
