@@ -38,6 +38,7 @@ pub async fn handle_request(
     app_cfg: Arc<AppConfig>,
     registry: ConnectionRegistry,
     shutdown_rx: ShutdownRx,
+    permit_slot: std::sync::Arc<std::sync::Mutex<Option<crate::conn_limiter::ConnPermit>>>,
 ) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
 
@@ -71,7 +72,14 @@ pub async fn handle_request(
                 let app_cfg2 = app_cfg.clone();
                 let reg2 = registry.clone();
                 let shutdown_rx2 = shutdown_rx.clone();
+                // Transfer the permit out of the slot so it lives until the
+                // WS session closes, not until serve_connection resolves at
+                // HTTP 101 dispatch. The serve-task's `_conn_permit_slot`
+                // clone is now empty for this connection (the slot is `None`),
+                // and this spawned future becomes the sole permit holder.
+                let ws_permit = permit_slot.lock().unwrap().take();
                 tokio::spawn(async move {
+                    let _permit = ws_permit; // dropped when client_connected returns (WS close)
                     if let Err(e) =
                         client_connected(websocket, app_cfg2, reg2, auth, space_id, shutdown_rx2)
                             .await

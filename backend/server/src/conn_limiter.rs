@@ -38,13 +38,16 @@ impl ConnLimiter {
 
     /// Returns a permit if both caps allow another connection from `ip`,
     /// else `None` (caller must drop the socket).
+    ///
+    /// A cap value of `0` means "unlimited" for that dimension (operator
+    /// opt-out rather than accidental total-lockout on a typo).
     pub fn try_acquire(&self, ip: IpAddr) -> Option<ConnPermit> {
         let mut c = self.counts.lock().unwrap();
-        if c.total >= self.max_global {
+        if self.max_global != 0 && c.total >= self.max_global {
             return None;
         }
         let entry = c.per_ip.entry(ip).or_insert(0);
-        if *entry >= self.max_per_ip {
+        if self.max_per_ip != 0 && *entry >= self.max_per_ip {
             return None;
         }
         *entry += 1;
@@ -67,7 +70,7 @@ impl Drop for ConnPermit {
         let mut c = self.counts.lock().unwrap();
         c.total = c.total.saturating_sub(1);
         if let Some(n) = c.per_ip.get_mut(&self.ip) {
-            *n -= 1;
+            *n = n.saturating_sub(1);
             if *n == 0 {
                 c.per_ip.remove(&self.ip);
             }
@@ -116,5 +119,15 @@ mod tests {
             let _p = l.try_acquire(ip(1)).unwrap();
         }
         assert!(l.is_empty(), "IP map entry removed when count hits 0");
+    }
+
+    #[test]
+    fn zero_cap_means_unlimited() {
+        // Both caps set to 0: every acquire must succeed (no cap applied).
+        let l = ConnLimiter::new(0, 0);
+        let mut permits = Vec::new();
+        for _ in 0..20 {
+            permits.push(l.try_acquire(ip(1)).expect("0-cap must be unlimited"));
+        }
     }
 }

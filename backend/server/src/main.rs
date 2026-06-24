@@ -238,8 +238,13 @@ async fn run_tls_server(
                 let app_cfg_conn = app_cfg.clone();
                 let reg_conn = registry.clone();
                 let conn_shutdown = shutdown_rx.clone();
+                // Wrap permit in a slot so it can be transferred into the WS
+                // session spawn (if the connection upgrades) while still being
+                // held by this serve task for plain HTTP / keep-alive.
+                let permit_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(permit)));
+                let svc_slot = permit_slot.clone();
                 tasks.spawn(async move {
-                    let _permit = permit;
+                    let _conn_permit_slot = permit_slot; // holds permit for non-upgrade lifetime
                     match acceptor.accept(tcp).await {
                         Ok(tls_stream) => {
                             if let Err(err) = hyper::server::conn::Http::new()
@@ -253,6 +258,7 @@ async fn run_tls_server(
                                             app_cfg_conn.clone(),
                                             reg_conn.clone(),
                                             conn_shutdown.clone(),
+                                            svc_slot.clone(),
                                         )
                                     }),
                                 )
@@ -332,8 +338,13 @@ async fn run_http_server(
                 let app_cfg_conn = app_cfg.clone();
                 let reg_conn = registry.clone();
                 let conn_shutdown = shutdown_rx.clone();
+                // Wrap permit in a slot so it can be transferred into the WS
+                // session spawn (if the connection upgrades) while still being
+                // held by this serve task for plain HTTP / keep-alive.
+                let permit_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(permit)));
+                let svc_slot = permit_slot.clone();
                 tasks.spawn(async move {
-                    let _permit = permit;
+                    let _conn_permit_slot = permit_slot; // holds permit for non-upgrade lifetime
                     if let Err(err) = hyper::server::conn::Http::new()
                         .http1_only(true)
                         .http1_keep_alive(true)
@@ -345,6 +356,7 @@ async fn run_http_server(
                                     app_cfg_conn.clone(),
                                     reg_conn.clone(),
                                     conn_shutdown.clone(),
+                                    svc_slot.clone(),
                                 )
                             }),
                         )
