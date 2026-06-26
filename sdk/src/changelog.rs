@@ -25,17 +25,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Max attempts when retrying a change submission rejected by the server
-/// because the client's `parent_change`/`parent_clc` anchor is stale (the
-/// server returned `FastForwardRequired`, surfaced from `ServerError::StaleParent`).
+/// because the client's `parent_change`/`parent_clc` anchor is stale, or
+/// because the change's `sig_ref` does not match the server's per-uid sigref
+/// (both surface as `FastForwardRequired` from `ServerError::StaleParent`).
 ///
-/// Each retry recovers via FF (which advances the client's anchor) then
-/// re-anchors and re-signs the change against the fresh state and
-/// resubmits. The cap
-/// guards against pathological races where every retry is immediately
-/// invalidated by yet another concurrent broadcast. In practice 1-2
-/// attempts suffice; we allow a few more before surfacing the error to
-/// the caller so the client can decide whether to keep trying.
-const MAX_STALE_PARENT_RETRIES: usize = 3;
+/// Each retry recovers via FF (which advances the client's anchor and syncs
+/// per-uid sigrefs), then re-anchors and re-signs the change against the
+/// fresh state and resubmits with exponential backoff. Six retries with
+/// 50–400 ms backoff span ~1.6 s of wait — enough to outlast a real FF
+/// proof window (~2–3 s on GPU) before surfacing the error to the caller.
+const MAX_STALE_PARENT_RETRIES: usize = 6;
 
 /// Map from user uid to the `(change_id, entry_hash)` pair for their most
 /// recent signed change inside an FF range. `entry_hash` is the
@@ -1593,6 +1592,11 @@ impl Space {
                     );
                     self.recover_via_fast_forward().await?;
                     self.reanchor_and_resign(&mut change).await;
+                    // Exponential backoff before resubmit: gives the server time to
+                    // finish an in-flight FF proof that likely caused the stale anchor.
+                    // Caps at 400 ms (attempt ≥ 4) to stay well inside the 5 s FF budget.
+                    let delay_ms = 50u64 * (1u64 << attempts.min(4));
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     attempts += 1;
                 }
                 Err(e) => return Err(e),

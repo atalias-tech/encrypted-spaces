@@ -506,11 +506,10 @@ pub enum ServerError {
     Generic(String),
     /// Authorization failure surfaced from the storage / validation layer.
     AccessDenied(String),
-    /// The submitted change's `parent_change` / `parent_clc` does not
-    /// match the server's current view of the changelog — either it is
-    /// outside the `MAX_PARENT_DISTANCE` window or its `parent_clc`
-    /// disagrees with the server's recorded root at that change. The
-    /// client must fast-forward and resign before retrying.
+    /// The submitted change's `parent_change`/`parent_clc` does not match the
+    /// server's current view of the changelog, or the change's `sig_ref` does
+    /// not match the server's per-uid sigref. In all cases the client must
+    /// fast-forward to the current state and resign before retrying.
     StaleParent(String),
 }
 impl From<ChangelogError> for ServerError {
@@ -2319,7 +2318,7 @@ impl SpaceState {
         // `changelog_core`.
         let expected_sig_ref = self.sigref_map.get(&entry.uid).copied().unwrap_or(0);
         check_sigref_continuity(entry, expected_sig_ref)
-            .map_err(|e| ServerError::Generic(e.to_string()))?;
+            .map_err(|e| ServerError::StaleParent(e.to_string()))?;
 
         let accepted_at_server_time = ChangelogEntry::get_unix_timestamp();
         validate_change_timestamp_at_acceptance(entry.timestamp, accepted_at_server_time)

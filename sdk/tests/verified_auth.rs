@@ -68,6 +68,8 @@ async fn start_test_server() -> TestServer {
         verbose_logfile: None,
         space_root: None,
         bootstrap_data: BootstrapDataSource::None,
+        max_req_per_sec: 0,
+        trusted_proxies: vec![],
     });
     let registry = new_connection_registry();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -90,13 +92,18 @@ async fn start_test_server() -> TestServer {
                     }
                 }
                 accept = listener.accept() => {
-                    let (tcp, _) = match accept {
+                    let (tcp, peer) = match accept {
                         Ok(pair) => pair,
                         Err(_) => continue,
                     };
                     let app_cfg_conn = app_cfg.clone();
                     let reg_conn = registry.clone();
                     let conn_shutdown = shutdown_rx.clone();
+                    let peer_ip = peer.ip();
+                    // Test server has no connection limiter; pass an empty permit slot.
+                    let permit_slot = std::sync::Arc::new(
+                        std::sync::Mutex::new(None::<encrypted_spaces_backend_server::conn_limiter::ConnPermit>),
+                    );
                     tokio::spawn(async move {
                         let _ = hyper::server::conn::Http::new()
                             .http1_only(true)
@@ -106,9 +113,11 @@ async fn start_test_server() -> TestServer {
                                 service_fn(move |req| {
                                     handle_request(
                                         req,
+                                        peer_ip,
                                         app_cfg_conn.clone(),
                                         reg_conn.clone(),
                                         conn_shutdown.clone(),
+                                        permit_slot.clone(),
                                     )
                                 }),
                             )
