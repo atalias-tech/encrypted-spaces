@@ -212,6 +212,10 @@ fn send_direct_response(
 // Per-connection state
 // ---------------------------------------------------------------------------
 
+/// Token-bucket burst cap: 2× the per-second rate allows short bursts without
+/// penalising legitimate clients that send a flurry of messages at startup.
+const MAX_BURST_MULTIPLIER: f32 = 2.0;
+
 /// Shared state for a single WebSocket connection, threaded through the read
 /// and write halves so helpers can access it without long parameter lists.
 struct ConnectionState {
@@ -227,6 +231,11 @@ struct ConnectionState {
     response_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Connection registry for broadcasts.
     conn_registry: ConnectionRegistry,
+    /// Real client IP (XFF-resolved when behind a trusted proxy).
+    real_ip: std::net::IpAddr,
+    // Token-bucket rate limiter fields.
+    rate_tokens: f32,
+    rate_last_tick: std::time::Instant,
 }
 
 impl ConnectionState {
@@ -234,6 +243,26 @@ impl ConnectionState {
         // Build from the VERIFIED uid established during the handshake, never the
         // client-asserted uid from the connection query string.
         AuthContext::new(self.verified_uid, self.space_id)
+    }
+
+    /// Consume one token from the bucket. Returns `true` if the frame is
+    /// allowed, `false` if the rate limit is exceeded and the connection
+    /// should be closed. `max_per_sec == 0` disables the limiter.
+    fn check_rate(&mut self, max_per_sec: u32) -> bool {
+        if max_per_sec == 0 {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.rate_last_tick).as_secs_f32();
+        self.rate_last_tick = now;
+        let cap = max_per_sec as f32 * MAX_BURST_MULTIPLIER;
+        self.rate_tokens = (self.rate_tokens + elapsed * max_per_sec as f32).min(cap);
+        if self.rate_tokens >= 1.0 {
+            self.rate_tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -433,6 +462,15 @@ async fn run_read_loop(
                     Ok(m) if m.is_binary() => {
                         let data = m.into_data();
                         log::debug!("ws: inbound binary len={}B", data.len());
+                        let max_rps = state.app_cfg.max_req_per_sec;
+                        if !state.check_rate(max_rps) {
+                            log::warn!(
+                                "space={} peer={} ws: rate limit exceeded, closing connection",
+                                state.space_id, state.real_ip
+                            );
+                            break;
+                        }
+                        // prost::DecodeContext caps recursion at 100 levels; malformed deep nesting returns Err.
                         match WsFrame::decode(&data[..]) {
                             Ok(frame) => dispatch_frame(frame, &mut state).await,
                             Err(e) => {
@@ -671,6 +709,7 @@ pub async fn client_connected(
     auth: Option<AuthContext>,
     space_id: SpaceId,
     shutdown_rx: ShutdownRx,
+    real_ip: std::net::IpAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The uid the client *asserts* via the connection query string. It is only
     // a hint for logging; the connection's effective uid is whatever the
@@ -701,6 +740,7 @@ pub async fn client_connected(
     let connection_id =
         register_connection(&conn_registry, space_id, &verified_ctx, &response_tx).await;
 
+    let max_rps = app_cfg.max_req_per_sec;
     let state = ConnectionState {
         space_id,
         connection_id,
@@ -708,6 +748,9 @@ pub async fn client_connected(
         verified_uid,
         response_tx,
         conn_registry: conn_registry.clone(),
+        real_ip,
+        rate_tokens: max_rps as f32 * MAX_BURST_MULTIPLIER,
+        rate_last_tick: std::time::Instant::now(),
     };
 
     let write_handle = tokio::spawn(run_write_loop(
@@ -1177,5 +1220,73 @@ mod tests {
     #[test]
     fn create_space_founder_uid_returns_none_for_none_op() {
         assert!(create_space_founder_uid(&None).is_none());
+    }
+
+    // ── Rate-limiter unit tests ──────────────────────────────────────────────
+
+    fn make_rate_state(max_per_sec: u32) -> ConnectionState {
+        use crate::app_config::{AppConfig, BootstrapDataSource};
+        let app_cfg = Arc::new(AppConfig {
+            verbose_logfile: None,
+            space_root: None,
+            bootstrap_data: BootstrapDataSource::None,
+            max_req_per_sec: max_per_sec,
+            trusted_proxies: vec![],
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ConnectionState {
+            space_id: SpaceId::random(),
+            connection_id: 0,
+            app_cfg,
+            verified_uid: None,
+            response_tx: tx,
+            conn_registry: crate::websocket::new_connection_registry(),
+            real_ip: "127.0.0.1".parse().unwrap(),
+            rate_tokens: max_per_sec as f32 * MAX_BURST_MULTIPLIER,
+            rate_last_tick: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let mut s = make_rate_state(10);
+        // Burst cap = 20; consuming 15 should all succeed.
+        for _ in 0..15 {
+            assert!(s.check_rate(10));
+        }
+    }
+
+    #[test]
+    fn rate_limiter_blocks_over_limit() {
+        let mut s = make_rate_state(10);
+        // Drain the full burst bucket (20 tokens) — all allowed.
+        for _ in 0..20 {
+            assert!(s.check_rate(10));
+        }
+        // One more without any time passing should be rejected.
+        assert!(!s.check_rate(10));
+    }
+
+    #[test]
+    fn rate_limiter_refills_over_time() {
+        let mut s = make_rate_state(10);
+        // Drain the bucket.
+        for _ in 0..20 {
+            s.check_rate(10);
+        }
+        assert!(!s.check_rate(10));
+        // Simulate 1 second of elapsed time by winding back last_tick.
+        s.rate_last_tick -= std::time::Duration::from_secs(1);
+        // Should have refilled ~10 tokens, so next call succeeds.
+        assert!(s.check_rate(10));
+    }
+
+    #[test]
+    fn rate_limiter_zero_means_unlimited() {
+        let mut s = make_rate_state(0);
+        // With max_per_sec=0, check_rate should always return true.
+        for _ in 0..10_000 {
+            assert!(s.check_rate(0));
+        }
     }
 }

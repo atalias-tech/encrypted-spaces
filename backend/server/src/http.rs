@@ -9,6 +9,7 @@ use hyper::body::Bytes;
 use hyper::{Body, Request, Response, StatusCode};
 use hyper_tungstenite::tungstenite::protocol::WebSocketConfig;
 use hyper_tungstenite::{is_upgrade_request, upgrade};
+use std::net::IpAddr;
 use std::{convert::Infallible, sync::Arc};
 
 /// Cap inbound WebSocket frames/messages to bound memory per connection.
@@ -22,24 +23,113 @@ pub(crate) fn ws_config() -> WebSocketConfig {
     c
 }
 
+/// Resolve the real client IP, honouring `X-Forwarded-For` only when the
+/// direct peer is in the operator-configured trusted-proxy list.
+///
+/// When trusted: takes the leftmost (client-claimed) IP from the XFF header.
+/// When untrusted or when XFF is absent/malformed: returns the peer IP as-is.
+pub(crate) fn resolve_real_ip(
+    peer: IpAddr,
+    headers: &hyper::HeaderMap,
+    trusted: &[IpAddr],
+) -> IpAddr {
+    if trusted.contains(&peer) {
+        if let Some(xff) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(ip) = xff
+                .split(',')
+                .next()
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            {
+                return ip;
+            }
+        }
+    }
+    peer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn ws_config_caps_message_size() {
         let c = ws_config();
         assert_eq!(c.max_message_size, Some(16 * 1024 * 1024));
         assert_eq!(c.max_frame_size, Some(16 * 1024 * 1024));
     }
+
+    fn make_xff_headers(value: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn xff_ignored_when_peer_not_trusted() {
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let trusted: Vec<IpAddr> = vec!["10.0.0.1".parse().unwrap()];
+        let headers = make_xff_headers("203.0.113.1");
+        // peer is NOT in trusted list → return peer as-is
+        assert_eq!(resolve_real_ip(peer, &headers, &trusted), peer);
+    }
+
+    #[test]
+    fn xff_used_when_peer_is_trusted() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: Vec<IpAddr> = vec![peer];
+        let headers = make_xff_headers("203.0.113.42");
+        assert_eq!(
+            resolve_real_ip(peer, &headers, &trusted),
+            "203.0.113.42".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn xff_leftmost_ip_taken() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: Vec<IpAddr> = vec![peer];
+        let headers = make_xff_headers("203.0.113.42, 10.0.0.1");
+        assert_eq!(
+            resolve_real_ip(peer, &headers, &trusted),
+            "203.0.113.42".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn xff_malformed_falls_back_to_peer() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: Vec<IpAddr> = vec![peer];
+        let headers = make_xff_headers("not-an-ip");
+        assert_eq!(resolve_real_ip(peer, &headers, &trusted), peer);
+    }
+
+    #[test]
+    fn xff_empty_trusted_list_ignores_header() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let headers = make_xff_headers("203.0.113.1");
+        assert_eq!(resolve_real_ip(peer, &headers, &[]), peer);
+    }
+
+    #[test]
+    fn xff_absent_header_returns_peer() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let trusted: Vec<IpAddr> = vec![peer];
+        assert_eq!(resolve_real_ip(peer, &hyper::HeaderMap::new(), &trusted), peer);
+    }
 }
 
 pub async fn handle_request(
     req: Request<Body>,
+    peer_ip: IpAddr,
     app_cfg: Arc<AppConfig>,
     registry: ConnectionRegistry,
     shutdown_rx: ShutdownRx,
     permit_slot: std::sync::Arc<std::sync::Mutex<Option<crate::conn_limiter::ConnPermit>>>,
 ) -> Result<Response<Body>, Infallible> {
+    let real_ip = resolve_real_ip(peer_ip, req.headers(), &app_cfg.trusted_proxies);
     let path = req.uri().path().to_string();
 
     if path.starts_with("/ws") && is_upgrade_request(&req) {
@@ -81,7 +171,7 @@ pub async fn handle_request(
                 tokio::spawn(async move {
                     let _permit = ws_permit; // dropped when client_connected returns (WS close)
                     if let Err(e) =
-                        client_connected(websocket, app_cfg2, reg2, auth, space_id, shutdown_rx2)
+                        client_connected(websocket, app_cfg2, reg2, auth, space_id, shutdown_rx2, real_ip)
                             .await
                     {
                         eprintln!("Websocket handling error: {e}");

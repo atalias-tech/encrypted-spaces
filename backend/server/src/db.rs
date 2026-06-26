@@ -4074,6 +4074,8 @@ mod tests {
             space_root: Some(dir.to_str().unwrap().to_string()),
             verbose_logfile: None,
             bootstrap_data: BootstrapDataSource::None,
+            max_req_per_sec: 0,
+            trusted_proxies: vec![],
         };
 
         // Run two concurrent first-connections to the same disk-backed space.

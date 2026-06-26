@@ -238,6 +238,7 @@ async fn run_tls_server(
                 let app_cfg_conn = app_cfg.clone();
                 let reg_conn = registry.clone();
                 let conn_shutdown = shutdown_rx.clone();
+                let peer_ip = peer.ip();
                 // Wrap permit in a slot so it can be transferred into the WS
                 // session spawn (if the connection upgrades) while still being
                 // held by this serve task for plain HTTP / keep-alive.
@@ -255,6 +256,7 @@ async fn run_tls_server(
                                     service_fn(move |req| {
                                         handle_request(
                                             req,
+                                            peer_ip,
                                             app_cfg_conn.clone(),
                                             reg_conn.clone(),
                                             conn_shutdown.clone(),
@@ -338,6 +340,7 @@ async fn run_http_server(
                 let app_cfg_conn = app_cfg.clone();
                 let reg_conn = registry.clone();
                 let conn_shutdown = shutdown_rx.clone();
+                let peer_ip = peer.ip();
                 // Wrap permit in a slot so it can be transferred into the WS
                 // session spawn (if the connection upgrades) while still being
                 // held by this serve task for plain HTTP / keep-alive.
@@ -353,6 +356,7 @@ async fn run_http_server(
                             service_fn(move |req| {
                                 handle_request(
                                     req,
+                                    peer_ip,
                                     app_cfg_conn.clone(),
                                     reg_conn.clone(),
                                     conn_shutdown.clone(),

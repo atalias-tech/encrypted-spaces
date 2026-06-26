@@ -54,6 +54,14 @@ pub struct CliArgs {
         default_value_t = 4096
     )]
     pub max_conns_global: usize,
+
+    /// Max WS frames per second per authenticated connection (0 = unlimited).
+    #[arg(long = "max-req-per-sec", env = "MAX_REQ_PER_SEC", default_value_t = 60)]
+    pub max_req_per_sec: u32,
+
+    /// Peer IPs to trust as reverse-proxy forwarders for X-Forwarded-For (comma-separated).
+    #[arg(long = "trusted-proxy", env = "TRUSTED_PROXY_IPS", value_delimiter = ',')]
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +76,8 @@ pub struct ServerConfig {
     pub tls_key: Option<String>,
     pub max_conns_per_ip: u32,
     pub max_conns_global: usize,
+    pub max_req_per_sec: u32,
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 impl ServerConfig {
@@ -89,6 +99,8 @@ impl From<&CliArgs> for ServerConfig {
             tls_key: args.tls_key.clone(),
             max_conns_per_ip: args.max_conns_per_ip,
             max_conns_global: args.max_conns_global,
+            max_req_per_sec: args.max_req_per_sec,
+            trusted_proxies: args.trusted_proxies.clone(),
         }
     }
 }
@@ -125,6 +137,10 @@ pub struct AppConfig {
     pub space_root: Option<String>,
     /// Optional schema bundle for all new spaces.
     pub bootstrap_data: BootstrapDataSource,
+    /// Max WS frames per second per authenticated connection (0 = unlimited).
+    pub max_req_per_sec: u32,
+    /// Peer IPs trusted to forward the real client IP via X-Forwarded-For.
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 impl AppConfig {
@@ -142,6 +158,8 @@ impl AppConfig {
             verbose_logfile: Some("logfile.txt".to_string()),
             space_root: args.space_root.clone(),
             bootstrap_data,
+            max_req_per_sec: args.max_req_per_sec,
+            trusted_proxies: args.trusted_proxies.clone(),
         })
     }
 }
@@ -223,5 +241,42 @@ mod tests {
     #[test]
     fn unknown_flag_is_error() {
         assert!(CliArgs::try_parse_from(["server", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn rate_limit_default() {
+        let args = CliArgs::try_parse_from(["server"]).unwrap();
+        assert_eq!(args.max_req_per_sec, 60);
+        assert!(args.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_flag() {
+        let args = CliArgs::try_parse_from(["server", "--max-req-per-sec", "120"]).unwrap();
+        assert_eq!(args.max_req_per_sec, 120);
+    }
+
+    #[test]
+    fn rate_limit_zero_means_unlimited() {
+        let args = CliArgs::try_parse_from(["server", "--max-req-per-sec", "0"]).unwrap();
+        assert_eq!(args.max_req_per_sec, 0);
+    }
+
+    #[test]
+    fn trusted_proxy_single() {
+        let args =
+            CliArgs::try_parse_from(["server", "--trusted-proxy", "10.0.0.1"]).unwrap();
+        assert_eq!(args.trusted_proxies, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn trusted_proxy_comma_separated() {
+        let args = CliArgs::try_parse_from([
+            "server",
+            "--trusted-proxy",
+            "10.0.0.1,192.168.1.1",
+        ])
+        .unwrap();
+        assert_eq!(args.trusted_proxies.len(), 2);
     }
 }
