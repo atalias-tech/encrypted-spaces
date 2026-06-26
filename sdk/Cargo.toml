@@ -16,6 +16,10 @@ local-transport = ["merk", "dep:encrypted-spaces-backend-server"]
 # image ID.  Off by default so production SDK builds skip the guest
 # compile.
 testing = ["encrypted-spaces-ffproof/prove"]
+# Activates real STARK proof verification on the client by disabling the
+# dev-mode override in `ensure_risc0_proof_mode()`. Use together with a
+# server built with `--features real-proofs` (optionally `,cuda`).
+real-proofs = ["encrypted-spaces-ffproof/real-proofs"]
 
 [dependencies]
 aes = { workspace = true }
