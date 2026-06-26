@@ -437,6 +437,19 @@ impl Space {
         self.id
     }
 
+    /// Re-establish the WebSocket connection using the stored auth context.
+    ///
+    /// Call this after a network drop is detected (e.g. when the broadcast
+    /// channel closes). The space's in-memory state (keys, CLC, pending
+    /// changes) is preserved — only the transport connection is torn down
+    /// and reconnected. After a successful reconnect, call
+    /// [`Space::subscribe_updates`] to get a fresh broadcast receiver.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn reconnect(&self) -> Result<()> {
+        let auth = self.with_state(|s| s.auth_context.clone());
+        self.transport.authenticate(&auth).await
+    }
+
     /// Return a typed handle to a SQL table named `name`.
     ///
     /// This does **not** create the underlying table. You must initialize the table
