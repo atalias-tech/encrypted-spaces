@@ -8,7 +8,7 @@ edition.workspace = true
 [features]
 default = ["merk_verify"]
 merk_verify = ["dep:merk", "dep:encrypted-spaces-changelog-core"]
-merk = ["merk_verify", "dep:merk", "dep:encrypted-spaces-changelog-core"]
+merk = ["merk_verify", "dep:merk", "dep:encrypted-spaces-changelog-core", "encrypted-spaces-changelog-core/prove"]
 
 [dependencies]
 encrypted-spaces-acl-types = { workspace = true }

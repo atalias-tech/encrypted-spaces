@@ -18,7 +18,11 @@ serde = {workspace = true}
 wasm-bindgen = {workspace = true}
 postcard = {workspace = true}
 merk = {workspace = true}
-ffproof-tracer = { path = "tracer" }
+# The tracer pulls a RISC-V guest crate (ffproof-tracer-methods); it is
+# prover-side only, so it is optional and enabled by `prove`. Verify-only
+# consumers (every client) never build it. `ffproof-tracer-shared` is pure
+# types (no guest) and stays unconditional.
+ffproof-tracer = { path = "tracer", optional = true }
 ffproof-tracer-shared = { path = "tracer/shared" }
 ctor = { workspace = true }
 
@@ -60,6 +64,6 @@ default = ["verify"]
 verify = []
 # Full crate including proof generation.  Pulls in the `methods` /
 # `client_methods` crates which trigger the RISC-V guest binary build.
-prove = ["verify", "dep:encrypted-spaces-ffproof-methods", "dep:encrypted-spaces-client-methods"]
+prove = ["verify", "dep:encrypted-spaces-ffproof-methods", "dep:encrypted-spaces-client-methods", "dep:ffproof-tracer", "encrypted-spaces-changelog-core/prove"]
 cuda = ["risc0-zkvm/cuda"]
 real-proofs = []

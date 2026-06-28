@@ -2529,6 +2529,8 @@ dependencies = [
  "encrypted-spaces-backend",
  "encrypted-spaces-ffproof",
  "encrypted-spaces-sdk",
+ "hex",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

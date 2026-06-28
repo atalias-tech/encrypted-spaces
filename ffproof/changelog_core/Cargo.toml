@@ -18,8 +18,11 @@ serde_json = { workspace = true }
 
 merk = { workspace = true }
 
-# Tracer dependencies for create_trace re-export
-ffproof-tracer = { path = "../tracer" }
+# `ffproof-tracer` pulls a RISC-V guest crate and is only needed for the
+# `create_trace`/`create_trace_full` re-export (trace generation, prover/
+# server side). Gated behind `prove` so verify-only consumers (every client)
+# never build the guest. `ffproof-tracer-shared` is pure types (no guest).
+ffproof-tracer = { path = "../tracer", optional = true }
 ffproof-tracer-shared = { path = "../tracer/shared" }
 
 # Storage encoding for key construction (users_row_key, etc.)
@@ -27,6 +30,9 @@ encrypted-spaces-storage-encoding = { workspace = true }
 
 [features]
 bench-timing = []
+# Trace generation (create_trace/create_trace_full). Prover/server only;
+# pulls the RISC-V guest tracer. Enabled by `ffproof/prove` and `backend/merk`.
+prove = ["dep:ffproof-tracer"]
 
 [dev-dependencies]
 serde = { workspace = true }

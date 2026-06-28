@@ -46,6 +46,7 @@
 use encrypted_spaces_acl_types::{Action, ActionLeg};
 use encrypted_spaces_backend::app_schema::{SchemaBundle, SchemaTable};
 use encrypted_spaces_backend::schema::{ColumnDefinition, ColumnType, Schema};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::{env, fs, io};
 
@@ -66,7 +67,33 @@ pub fn compile(kdl_path: impl AsRef<Path>) -> io::Result<()> {
         .canonicalize()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
     let kdl_abs_str = kdl_abs.to_string_lossy().into_owned();
-    let commitment = compute_data_commitment(&kdl_abs_str)?;
+
+    // DATA_COMMITMENT is the genesis Merk root for this schema. Computing it
+    // needs the write-capable `merk` backend (which pulls the RISC-V guest), so
+    // a verify-only client build PINS it via `ENCRYPTED_SPACES_DATA_COMMITMENT_FILE`
+    // — the server (which has `merk` + the prover) is the authoritative source,
+    // exactly like the FF guest ImageID.
+    println!("cargo:rerun-if-env-changed=ENCRYPTED_SPACES_DATA_COMMITMENT_FILE");
+    let commitment = match env::var_os("ENCRYPTED_SPACES_DATA_COMMITMENT_FILE") {
+        Some(path_os) => {
+            let path = Path::new(&path_os);
+            println!("cargo:rerun-if-changed={}", path.display());
+            read_data_commitment_from_file(path, &kdl)?
+        }
+        // Regen path: compute it from the schema (spins up an in-process backend
+        // + builds the guest). Only available with the `compute-commitment` feature.
+        #[cfg(feature = "compute-commitment")]
+        None => compute_data_commitment(&kdl_abs_str)?,
+        #[cfg(not(feature = "compute-commitment"))]
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "ENCRYPTED_SPACES_DATA_COMMITMENT_FILE must be set so the client pins \
+                 the schema's genesis data commitment. (Build sdk-codegen with \
+                 --features compute-commitment only to compute it from the schema.)",
+            ));
+        }
+    };
 
     // The FF-proof guest's image ID is normally produced at build time
     // by risc0-build inside the methods crate and re-exported from
@@ -90,7 +117,20 @@ pub fn compile(kdl_path: impl AsRef<Path>) -> io::Result<()> {
             println!("cargo:rerun-if-changed={}", path.display());
             read_image_id_from_file(path)?
         }
+        // Verify-only (client) builds pin the server's FF guest ImageID via the
+        // file above and never build the guest. Only a build that opts into
+        // `local-guest-id` derives the ID from a locally-built guest.
+        #[cfg(feature = "local-guest-id")]
         None => encrypted_spaces_ffproof::EXTEND_FF_ID,
+        #[cfg(not(feature = "local-guest-id"))]
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "ENCRYPTED_SPACES_FF_IMAGE_ID_FILE must be set so the client pins the \
+                 server's FF guest ImageID. (Build sdk-codegen with --features \
+                 local-guest-id only to derive the ID from a locally built guest.)",
+            ));
+        }
     };
 
     let generated = render(&bundle, &commitment, &ff_guest_image_id, &kdl_abs_str);
@@ -105,8 +145,11 @@ pub fn compile(kdl_path: impl AsRef<Path>) -> io::Result<()> {
     fs::write(out_path, generated)
 }
 
-/// Spin up a fresh in-process backend with the schema's tables and
-/// ACL rows initialised, then read the merk root.
+/// Spin up a fresh in-process backend with the schema's tables and ACL rows
+/// initialised, then read the merk root. Compute path only — pulls the
+/// in-process backend/server and the RISC-V guest; used to (re)generate the
+/// pinned `config/data_commitment.txt`, never on client builds.
+#[cfg(feature = "compute-commitment")]
 fn compute_data_commitment(kdl_abs_path: &str) -> io::Result<[u8; 32]> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -123,6 +166,68 @@ fn compute_data_commitment(kdl_abs_path: &str) -> io::Result<[u8; 32]> {
         .map_err(|e: encrypted_spaces_backend::error::SdkError| {
             io::Error::other(format!("failed to compute data_commitment: {e}"))
         })
+}
+
+/// Read the pinned genesis `DATA_COMMITMENT` from a file and verify it still
+/// matches the current schema. The file holds two `key = hex` lines:
+///   schema_sha256   = <sha-256 of the app_schema.kdl bytes it was generated from>
+///   data_commitment = <the 32-byte genesis Merk root, hex>
+/// `#` comments and blank lines are ignored. Checking `schema_sha256` against
+/// the current schema turns a stale pin into a build error instead of a silent
+/// client/server commitment mismatch at runtime.
+fn read_data_commitment_from_file(path: &Path, kdl: &str) -> io::Result<[u8; 32]> {
+    let err = |msg: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("ENCRYPTED_SPACES_DATA_COMMITMENT_FILE='{}': {msg}", path.display()),
+        )
+    };
+    let raw = fs::read_to_string(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("ENCRYPTED_SPACES_DATA_COMMITMENT_FILE='{}': {e}", path.display()),
+        )
+    })?;
+
+    let mut schema_sha256: Option<String> = None;
+    let mut commitment_hex: Option<String> = None;
+    for line in raw.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim().trim_start_matches("0x").to_string();
+            match k.trim() {
+                "schema_sha256" => schema_sha256 = Some(v),
+                "data_commitment" => commitment_hex = Some(v),
+                _ => {}
+            }
+        }
+    }
+    let schema_sha256 =
+        schema_sha256.ok_or_else(|| err("missing `schema_sha256 = <hex>` line".into()))?;
+    let commitment_hex =
+        commitment_hex.ok_or_else(|| err("missing `data_commitment = <hex>` line".into()))?;
+
+    // Guard: the pin must match the schema it was generated from. Normalize
+    // CRLF -> LF first so a Windows (CRLF) checkout and a Linux (LF) server
+    // fingerprint identical schema content identically.
+    let normalized = kdl.replace("\r\n", "\n");
+    let actual_schema = hex::encode(Sha256::digest(normalized.as_bytes()));
+    if !actual_schema.eq_ignore_ascii_case(&schema_sha256) {
+        return Err(err(format!(
+            "stale pin: app_schema.kdl fingerprint {actual_schema} does not match pinned \
+             schema_sha256 {schema_sha256}. Regenerate the data commitment with \
+             `--features compute-commitment` and re-pin config/data_commitment.txt."
+        )));
+    }
+
+    let bytes =
+        hex::decode(&commitment_hex).map_err(|e| err(format!("data_commitment is not valid hex: {e}")))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        err(format!(
+            "data_commitment must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ))
+    })
 }
 
 // ─── Code generation ──────────────────────────────────────────────────────────
@@ -229,9 +334,17 @@ fn render(
          \x20   /// event (rolling-upgrade support is future work).\n\
          \x20   pub const FF_GUEST_IMAGE_ID: [u32; 8] = [{image_id_lit}];\n\n"
     ));
+    // `include_bytes!` takes a string literal. On Windows the canonicalized
+    // path is the UNC `\\?\C:\...` form whose backslashes are invalid string
+    // escapes (`\C`, `\U`, ...). Strip the UNC prefix and use forward slashes —
+    // escape-free and accepted by the compiler's file loader on every platform.
+    let kdl_include = kdl_abs_path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(kdl_abs_path)
+        .replace('\\', "/");
     out.push_str(&format!(
         "    /// Raw KDL bytes for the schema this codegen was run against.\n\
-         \x20   pub const SCHEMA_KDL: &[u8] = include_bytes!(\"{kdl_abs_path}\");\n\n"
+         \x20   pub const SCHEMA_KDL: &[u8] = include_bytes!(\"{kdl_include}\");\n\n"
     ));
     out.push_str(
         "    /// Convenience constructor pairing the schema bytes with the\n\

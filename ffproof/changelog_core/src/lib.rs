@@ -14,7 +14,10 @@ pub use encrypted_spaces_storage_encoding::keys::{
 // Re-export merk hash test for zkVM verification
 pub use merk::zkvm_hash_tests;
 
-// Optional: trace proof helpers
+// Trace generation helpers (prover/server side only — pull the RISC-V guest
+// tracer). Verify-only consumers use `verify_trace` from the guest-free
+// `ffproof_tracer_shared` below.
+#[cfg(feature = "prove")]
 pub use ffproof_tracer::trace_prove::{create_trace, create_trace_full};
 pub use ffproof_tracer_shared::{
     apply_batch, collect_range, decode_pruned_compact_to_merk, encode_pruned_compact,
