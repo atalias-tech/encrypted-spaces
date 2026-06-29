@@ -114,5 +114,14 @@ pub(crate) fn verify_ff_internal(proof: &FFProof, expected_image_id: [u32; 8]) -
         return false;
     }
 
+    // Success is otherwise silent (only failures logged), which makes real-proof
+    // verification invisible in logs. Log it at info so a verified STARK is
+    // observable end-to-end.
+    log::info!(
+        "verify_ff: real STARK receipt VERIFIED ✓ (changes up to {}, verify took {:?})",
+        io.end_change_id,
+        std::time::Instant::now() - start_time
+    );
+
     true
 }
