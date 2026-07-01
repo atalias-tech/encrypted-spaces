@@ -15,7 +15,7 @@ use encrypted_spaces_backend_server::db::ServerError;
 use encrypted_spaces_backend_server::SpaceState;
 use encrypted_spaces_changelog_core::changelog::ChangeLog;
 use encrypted_spaces_changelog_core::changelog::{Change, ChangeResponse, FastForwardData};
-use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
+use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest, ScopedInviteRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -412,6 +412,20 @@ impl Transport for LocalTransport {
             .handle_add_member(&request, insert_change, &auth_context, &retention_proofs)
             .await
             .map_err(|e| SdkError::DatabaseError(format!("handle_add_member failed: {e}")))
+    }
+
+    async fn scoped_add_member(
+        &self,
+        request: ScopedInviteRequest,
+        insert_change: &Change,
+        retention_proofs: Vec<Vec<u8>>,
+    ) -> Result<ChangeResponse> {
+        let auth_context = self.auth_context.lock().await;
+        let mut state = self.state.lock().await;
+        state
+            .handle_scoped_add_member(&request, insert_change, &auth_context, &retention_proofs)
+            .await
+            .map_err(|e| SdkError::DatabaseError(format!("handle_scoped_add_member failed: {e}")))
     }
 
     async fn remove_member(

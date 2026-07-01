@@ -332,6 +332,95 @@ impl Space {
         })
     }
 
+    /// Invite a member with **scoped** read access (L2): it receives only the
+    /// subtree keys for `channels`, never the group key, and joins as a scoped
+    /// member that can read exactly those channels. The caller must be a full
+    /// member (holds the group key) so it can derive the channel subtree keys.
+    pub async fn invite_user_scoped(&self, channels: &[i64]) -> Result<SpaceInvite, SdkError> {
+        use encrypted_spaces_crypto::key_derivation::{
+            DerivationKoalaBearPoseidon2_16, KeyDerivation,
+        };
+        use encrypted_spaces_key_manager::{prove_channel_delivery, ScopedInviteRequest};
+
+        // 1. Provisional keypairs for the new member.
+        let new_user = UserWithSecrets::provisional();
+        let new_pk = new_user.update_key_pair.public().clone();
+
+        // 2. Derive each channel's subtree key from our group key and build the
+        //    per-channel mVE delivery to the new member.
+        let scoped_request = {
+            let km = self.key_manager.lock().await;
+            let tree = km.space_key();
+            let derivation = DerivationKoalaBearPoseidon2_16::default();
+            let mut reqs = Vec::with_capacity(channels.len());
+            for &ch in channels {
+                let subtree = tree.channel_subtree_key(ch).ok_or_else(|| {
+                    SdkError::ValidationError(
+                        "only a full member can issue a scoped invite".into(),
+                    )
+                })?;
+                let commitment = derivation.commit(&subtree);
+                reqs.push(prove_channel_delivery(
+                    ch,
+                    commitment,
+                    &subtree,
+                    std::slice::from_ref(&new_pk),
+                ));
+            }
+            ScopedInviteRequest { channels: reqs }
+        };
+
+        // 3. Insert the provisional _users record (InviteUser op, no retention
+        //    writes — a scoped invite delivers no group key). _users is plaintext,
+        //    so encrypt_query_fields is a no-op even without a group key.
+        let mut pending_record = new_user.as_record();
+        pending_record.status = UserStatus::Provisional;
+        let mut insert_builder = self.users().insert(&pending_record);
+        insert_builder.take_pending_error()?;
+        crate::crypto::encrypt_query_fields(&mut insert_builder.query, self).await?;
+        let change = {
+            use crate::changelog::ChangeBuilder;
+            ChangeBuilder::new(&mut insert_builder.query, std::sync::Arc::new(self.clone()))
+                .build_invite_user(&[])
+                .await?
+        };
+
+        // 4. Submit via the scoped path (deposits a ScopedDeliveryEnvelope).
+        let change_response = self
+            .transport
+            .scoped_add_member(scoped_request, &change, vec![])
+            .await?;
+
+        // 5. Apply + extract the new uid (same discharge handling as invite_user).
+        let completed = self.complete_submitted(change, change_response).await?;
+        let new_user_id = if let Some(writes) = &completed.sequential_writes {
+            crate::cache::update_cache_from_proven_writes(self, &completed.change, writes).await;
+            crate::cache::new_row_id_for_table(self, writes, USERS_TABLE_NAME).ok_or_else(|| {
+                SdkError::InsertError("scoped InviteUser proof wrote no new _users row".into())
+            })?
+        } else if let Some(id) = completed
+            .ff_inserted_ids
+            .get(&completed.change.entry.signature)
+            .copied()
+        {
+            id
+        } else {
+            let writes =
+                self.validate_and_apply_change(&completed.change.entry, &completed.response)?;
+            crate::cache::update_cache_from_proven_writes(self, &completed.change, &writes).await;
+            crate::cache::new_row_id_for_table(self, &writes, USERS_TABLE_NAME).ok_or_else(|| {
+                SdkError::InsertError("scoped InviteUser proof wrote no new _users row".into())
+            })?
+        };
+
+        let mut result_user = new_user;
+        result_user.id = Some(new_user_id);
+        Ok(SpaceInvite {
+            user: result_user,
+            space_id: self.id,
+        })
+    }
+
     pub async fn remove_user(&self, user_id: i64) -> Result<(), SdkError> {
         use encrypted_spaces_backend::internal_schemas::{
             KEY_HISTORY_COL_OLD_AUTH_KEY, KEY_HISTORY_COL_UID, KEY_HISTORY_COL_VALID_FROM,

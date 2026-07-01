@@ -39,8 +39,9 @@ use encrypted_spaces_ffproof::common::FFProof;
 use encrypted_spaces_ffproof::prover::update_changelog_proof;
 use encrypted_spaces_key_manager::operation::AsyncReader;
 use encrypted_spaces_key_manager::{
-    verify_invite, verify_rekey, CollectingOperationBuilder, DefaultMkem, GkDeliveryEnvelope,
-    InviteRequest, KeyManagerError, PendingWritesView, RekeyRequest, SpaceKey,
+    verify_channel_delivery, verify_invite, verify_rekey, CollectingOperationBuilder, DefaultMkem,
+    GkDeliveryEnvelope, InviteRequest, KeyManagerError, PendingWritesView, RekeyRequest,
+    ScopedChannelDelivery, ScopedDeliveryEnvelope, ScopedInviteRequest, SpaceKey,
 };
 use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
 use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
@@ -2897,6 +2898,106 @@ impl SpaceState {
         };
         let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| {
             ServerError::Generic(format!("delivery envelope serialization failed: {e}"))
+        })?;
+        self.key_delivery_slots.put(new_user_id, envelope_bytes);
+
+        Ok(change_response)
+    }
+
+    /// Add a member with **scoped** read access (L2): the invitee is delivered
+    /// only the channel subtree keys in `request`, never the group key. Mirrors
+    /// [`Self::handle_add_member`] but verifies each channel's delivery mVE and
+    /// deposits a [`ScopedDeliveryEnvelope`] in the invitee's slot instead of the
+    /// group-key envelope.
+    ///
+    /// There is intentionally **no** canonical-commitment check: channel keys are
+    /// pure client-side derivation with no on-chain commitment, and the inviter
+    /// (a full member/admin) chooses the invitee's scope. A malformed/wrong key
+    /// only denies the invitee that channel — it cannot leak group data — so the
+    /// server verifies only that each delivery is a well-formed mVE to the invitee.
+    pub async fn handle_scoped_add_member(
+        &mut self,
+        request: &ScopedInviteRequest,
+        insert_change: &Change,
+        auth: &AuthContext,
+        retention_proofs: &[Vec<u8>],
+    ) -> Result<ChangeResponse, ServerError> {
+        self.validate_hashed_values(&insert_change.hashed_values)?;
+
+        // 1. Extract the new member's update PK from the signed _users insert.
+        let new_member_pk: <DefaultMkem as Mkem>::PublicKey = {
+            let update_key_bytes = column_value_for_table(
+                insert_change,
+                USERS_TABLE_NAME,
+                "update_key",
+                &insert_change.hashed_values,
+            )
+            .ok_or_else(|| {
+                ServerError::Generic("missing _users.update_key entry in scoped invite change".into())
+            })?;
+            let update_key_json: Value =
+                stored_value::bytes_to_value(&update_key_bytes).map_err(|e| {
+                    ServerError::Generic(format!("decode _users.update_key bytes: {e}"))
+                })?;
+            let update_key_b64 = update_key_json.as_str().ok_or_else(|| {
+                ServerError::Generic("_users.update_key is not a base64 string".into())
+            })?;
+            let json_bytes = base64::engine::general_purpose::STANDARD
+                .decode(update_key_b64)
+                .map_err(|e| ServerError::Generic(format!("base64 decode update_key: {e}")))?;
+            serde_json::from_slice(&json_bytes)
+                .map_err(|e| ServerError::Generic(format!("deserialize update_key: {e}")))?
+        };
+
+        // 2. Verify each channel delivery's mVE (bound to its own commitment) and
+        //    collect the per-recipient ciphertexts.
+        let mut deliveries = Vec::with_capacity(request.channels.len());
+        for ch_req in &request.channels {
+            let ciphertexts =
+                verify_channel_delivery(std::slice::from_ref(&new_member_pk), ch_req).map_err(
+                    |_| {
+                        ServerError::Generic(
+                            "scoped channel delivery mVE verification failed".to_string(),
+                        )
+                    },
+                )?;
+            let ciphertext = ciphertexts.get(0).ok_or_else(|| {
+                ServerError::Generic("missing scoped channel ciphertext".to_string())
+            })?;
+            deliveries.push(ScopedChannelDelivery {
+                channel: ch_req.channel,
+                binding_commitment: ch_req.commitment,
+                ciphertext: ciphertext.clone(),
+            });
+        }
+
+        // 3. Verify retention proofs (InviteUser writes no retention → none expected).
+        self.verify_retention_proofs_from_change(
+            insert_change.entry.message.op_type,
+            retention_proofs,
+            insert_change,
+        )
+        .await?;
+
+        // 4. Insert the new user record.
+        let change_response = self.handle_change(insert_change, auth).await?;
+
+        // 5. Extract the newly assigned user id.
+        let new_user_id = extract_row_id_from_invite_user_proof(
+            &insert_change.entry,
+            &change_response.pruned_merkle_tree,
+            &change_response.old_root,
+            &change_response.new_root,
+            change_response.change_id as usize,
+        )
+        .map_err(|e| ServerError::Generic(format!("extract row id failed: {e:?}")))?;
+
+        // 6. Deposit the scoped delivery envelope (channel keys only, no group key).
+        let envelope = ScopedDeliveryEnvelope {
+            channels: deliveries,
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| {
+            ServerError::Generic(format!("scoped delivery envelope serialization failed: {e}"))
         })?;
         self.key_delivery_slots.put(new_user_id, envelope_bytes);
 

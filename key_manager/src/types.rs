@@ -54,6 +54,32 @@ pub struct ChannelDeliveryRequest {
     pub proof: PoseidonMveProof<DefaultMkem>,
 }
 
+/// Client -> Server: invite a member with **scoped** read access — it receives
+/// only these channels' subtree keys, never the group key. Each entry is an mVE
+/// delivery of one channel's derived subtree key to the new member's update key.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScopedInviteRequest {
+    pub channels: Vec<ChannelDeliveryRequest>,
+}
+
+/// One channel's subtree key mVE-wrapped to a scoped member (server-side, after
+/// verifying the delivery proof).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScopedChannelDelivery {
+    pub channel: i64,
+    pub binding_commitment: KeyCommitment,
+    pub ciphertext: MveRecipientCiphertext<DefaultMkem, KeyMaterial>,
+}
+
+/// A scoped member's delivery slot: channel subtree keys only, **no group key**.
+/// The read-scoping counterpart to [`GkDeliveryEnvelope`]. Its fields are
+/// disjoint from `GkDeliveryEnvelope`, so `join` distinguishes the two by
+/// attempting the full envelope first and falling back to this.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScopedDeliveryEnvelope {
+    pub channels: Vec<ScopedChannelDelivery>,
+}
+
 // ---------------------------------------------------------------------------
 // GK delivery slot
 // ---------------------------------------------------------------------------

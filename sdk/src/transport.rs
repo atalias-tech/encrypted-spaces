@@ -6,7 +6,7 @@ use encrypted_spaces_backend::{
     schema::Schema,
 };
 use encrypted_spaces_changelog_core::changelog::{Change, ChangeResponse, FastForwardData};
-use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
+use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest, ScopedInviteRequest};
 use std::any::Any;
 use std::collections::HashMap;
 
@@ -108,6 +108,23 @@ pub trait Transport: Send + Sync + 'static {
         insert_change: &Change,
         retention_proofs: Vec<Vec<u8>>,
     ) -> Result<ChangeResponse>;
+
+    /// Add a member with **scoped** read access (L2 read scoping).
+    ///
+    /// Inserts the new user record and deposits a `ScopedDeliveryEnvelope`
+    /// (channel subtree keys only, **no group key**) in their delivery slot, so
+    /// the invitee joins as a scoped member that can read only those channels.
+    /// Default errors; real transports (LocalTransport, WebSocketTransport) override.
+    async fn scoped_add_member(
+        &self,
+        _request: ScopedInviteRequest,
+        _insert_change: &Change,
+        _retention_proofs: Vec<Vec<u8>>,
+    ) -> Result<ChangeResponse> {
+        Err(SdkError::ValidationError(
+            "scoped_add_member is not supported by this transport".into(),
+        ))
+    }
 
     /// Remove a member from the group.
     ///

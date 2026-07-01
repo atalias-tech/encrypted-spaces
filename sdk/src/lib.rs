@@ -325,18 +325,45 @@ impl Space {
         let envelope_bytes = transport.fetch_my_key_delivery().await?.ok_or_else(|| {
             SdkError::JoinError("no GK delivery slot found for invitee".to_string())
         })?;
-        let envelope: GkDeliveryEnvelope = serde_json::from_slice(&envelope_bytes)
-            .map_err(|e| SdkError::JoinError(format!("invalid delivery envelope: {e}")))?;
-
-        // Bootstrap the key chain directly from the delivered envelope.
-        // Canonical retention state is fetched from `_retention` during
-        // `restore()` below; no retention rows are written locally here.
-        let key_manager: SpaceKeyManager = KeyManager::from_delivery_envelope(
-            invite.user.update_key_pair,
-            invite.user.auth_key_pair,
-            &envelope,
-        )
-        .map_err(|e| SdkError::JoinError(format!("failed to process invite: {e:?}")))?;
+        // Bootstrap the key chain from the delivered envelope. A full member
+        // gets a group-key envelope (GkDeliveryEnvelope); a scoped member (L2)
+        // gets a ScopedDeliveryEnvelope carrying only its channel subtree keys.
+        // The two have disjoint fields, so try the full one first.
+        let key_manager: SpaceKeyManager = if let Ok(envelope) =
+            serde_json::from_slice::<GkDeliveryEnvelope>(&envelope_bytes)
+        {
+            KeyManager::from_delivery_envelope(
+                invite.user.update_key_pair,
+                invite.user.auth_key_pair,
+                &envelope,
+            )
+            .map_err(|e| SdkError::JoinError(format!("failed to process invite: {e:?}")))?
+        } else {
+            let scoped: encrypted_spaces_key_manager::ScopedDeliveryEnvelope =
+                serde_json::from_slice(&envelope_bytes).map_err(|e| {
+                    SdkError::JoinError(format!("invalid delivery envelope: {e}"))
+                })?;
+            // Build a scoped read plane and install each delivered channel key.
+            // `decrypt_delivered_key` verifies each key against its commitment.
+            let mut km: SpaceKeyManager = KeyManager::new(
+                invite.user.update_key_pair,
+                invite.user.auth_key_pair,
+                TreeSpaceKey::scoped(std::iter::empty()),
+            );
+            let mut channel_keys = Vec::with_capacity(scoped.channels.len());
+            for ch in &scoped.channels {
+                let key = km
+                    .decrypt_delivered_key(&ch.ciphertext, ch.binding_commitment)
+                    .map_err(|_| {
+                        SdkError::JoinError("failed to decrypt scoped channel key".into())
+                    })?;
+                channel_keys.push((ch.channel, key));
+            }
+            for (ch, key) in channel_keys {
+                km.space_key_mut().install_channel_key(ch, key);
+            }
+            km
+        };
 
         let (dc, table_schemas, actions, ff_image_id) = schema.into_parts().await?;
 

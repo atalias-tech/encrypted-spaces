@@ -348,6 +348,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_agent_reads_only_its_channels() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+        let msgs = alice.table::<Msg>("msgs");
+        msgs.insert(&Msg { id: None, channel_id: 1, body: "secret in ch1".into() })
+            .execute()
+            .await?;
+        msgs.insert(&Msg { id: None, channel_id: 2, body: "secret in ch2".into() })
+            .execute()
+            .await?;
+
+        // Invite an agent SCOPED to channel 1 only; it joins with no group key,
+        // holding only channel 1's subtree key.
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        // The agent has the app schema (in the real app it joins with it); register
+        // the msgs table locally so it decrypts (and thus scopes) reads.
+        agent.register_table_schema(msgs_schema()?);
+
+        // The agent reads only channel 1's row — channel 2 is cryptographically
+        // out of scope (its key is underivable), so that row is dropped.
+        let rows: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert_eq!(rows.len(), 1, "scoped agent must see only its channel");
+        assert_eq!(rows[0].channel_id, 1);
+        assert_eq!(rows[0].body, "secret in ch1");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn any_channel_derives_without_setup() -> Result<()> {
         let (_, space) = create_space().await?;
         space.create_table(&msgs_schema()?).await?;
