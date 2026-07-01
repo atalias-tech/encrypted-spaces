@@ -12,6 +12,7 @@ message DbRequest {
     RemoveMemberRequest remove_member = 6;
     FetchMyKeyDeliveryRequest fetch_my_key_delivery = 8;
     RetentionRequest retention = 9;
+    ScopedAddMemberRequest scoped_add_member = 12;
   }
 }
 
@@ -27,6 +28,7 @@ message DbResponse {
     RemoveMemberResponse remove_member = 8;
     FetchMyKeyDeliveryResponse fetch_my_key_delivery = 10;
     RetentionResponse retention = 11;
+    ScopedAddMemberResponse scoped_add_member = 12;
   }
 }
 
@@ -279,6 +281,16 @@ message AddMemberRequest {
   bytes payload = 1;              // JSON-serialized InviteRequest
   ChangeRequest insert = 2;       // Insert query + changelog entry for the new user record
   repeated bytes retention_proofs = 3; // Serialized retention proofs for server verification
+}
+
+message ScopedAddMemberRequest {
+  bytes payload = 1;              // JSON-serialized ScopedInviteRequest (channel deliveries)
+  ChangeRequest insert = 2;       // Insert query + changelog entry for the new user record
+  repeated bytes retention_proofs = 3; // Serialized retention proofs for server verification
+}
+
+message ScopedAddMemberResponse {
+  ChangeResponse change = 1;      // ChangeResponse from inserting the new user record
 }
 
 message AddMemberResponse {

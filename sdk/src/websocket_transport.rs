@@ -822,6 +822,41 @@ impl Transport for WebSocketTransport {
         }
     }
 
+    async fn scoped_add_member(
+        &self,
+        request: encrypted_spaces_key_manager::ScopedInviteRequest,
+        insert_change: &Change,
+        retention_proofs: Vec<Vec<u8>>,
+    ) -> Result<ChangeResponse> {
+        use encrypted_spaces_backend::proto::ScopedAddMemberRequest;
+        let payload = serde_json::to_vec(&request).map_err(|e| {
+            SdkError::ValidationError(format!("failed to serialize ScopedInviteRequest: {e}"))
+        })?;
+
+        let insert_change_req = change_request_from_change(insert_change, vec![]);
+
+        let req = DbRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            operation: Some(db_request::Operation::ScopedAddMember(ScopedAddMemberRequest {
+                payload,
+                insert: Some(insert_change_req),
+                retention_proofs,
+            })),
+        };
+
+        let resp = self.send_request(req).await?;
+
+        if let Some(db_response::Result::ScopedAddMember(add_resp)) = resp.result {
+            let change_response: ChangeResponse = add_resp
+                .change
+                .ok_or_else(|| SdkError::DatabaseError("missing change response".into()))?
+                .try_into()?;
+            Ok(change_response)
+        } else {
+            Err(SdkError::DatabaseError("unexpected response type".into()))
+        }
+    }
+
     async fn remove_member(
         &self,
         request: RekeyRequest,

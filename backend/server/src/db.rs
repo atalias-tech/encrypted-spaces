@@ -124,6 +124,7 @@ pub(crate) fn op_name(op: &Option<db_request::Operation>) -> &'static str {
         db_request::Operation::Change(_) => "Change",
         db_request::Operation::FastForward(_) => "FastForward",
         db_request::Operation::AddMember(_) => "AddMember",
+        db_request::Operation::ScopedAddMember(_) => "ScopedAddMember",
         db_request::Operation::RemoveMember(_) => "RemoveMember",
         db_request::Operation::FetchMyKeyDelivery(_) => "FetchMyKeyDelivery",
         db_request::Operation::Retention(_) => "Retention",
@@ -3465,6 +3466,9 @@ async fn process_request_directly(
             )
             .await
         }
+        Some(db_request::Operation::ScopedAddMember(req)) => {
+            handle_scoped_add_member_request(&request.request_id, req, &app_cfg, &auth_context).await
+        }
         Some(db_request::Operation::AddMember(add_member_req)) => {
             handle_add_member_request(&request.request_id, add_member_req, &app_cfg, &auth_context)
                 .await
@@ -3656,6 +3660,56 @@ async fn handle_add_member_request(
         Ok(change_response) => ok_response(
             request_id,
             db_response::Result::AddMember(proto::AddMemberResponse {
+                change: Some(proto::ChangeResponse::from(&change_response)),
+            }),
+        ),
+        Err(e) => error_response(request_id, &e.to_string()),
+    }
+}
+
+async fn handle_scoped_add_member_request(
+    request_id: &str,
+    req: proto::ScopedAddMemberRequest,
+    app_cfg: &AppConfig,
+    auth_context: &AuthContext,
+) -> DbResponse {
+    let scoped_request: ScopedInviteRequest = match serde_json::from_slice(&req.payload) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(request_id, &format!("invalid scoped_add_member payload: {e}"))
+        }
+    };
+    let insert_change_req = match req.insert {
+        Some(cr) => cr,
+        None => return error_response(request_id, "missing insert change_request"),
+    };
+    let insert_entry: ChangelogEntry = match insert_change_req.change {
+        Some(ce) => ce.into(),
+        None => return error_response(request_id, "missing changelog_entry in insert"),
+    };
+    let insert_change = Change {
+        entry: insert_entry,
+        hashed_values: proto::values_sidecar_from_proto(insert_change_req.values_sidecar),
+    };
+
+    let space = match get_or_create_space(auth_context.space_id, Some(app_cfg)).await {
+        Ok(s) => s,
+        Err(e) => return error_response(request_id, &e.to_string()),
+    };
+    let result = space
+        .lock()
+        .await
+        .handle_scoped_add_member(
+            &scoped_request,
+            &insert_change,
+            auth_context,
+            &req.retention_proofs,
+        )
+        .await;
+    match result {
+        Ok(change_response) => ok_response(
+            request_id,
+            db_response::Result::ScopedAddMember(proto::ScopedAddMemberResponse {
                 change: Some(proto::ChangeResponse::from(&change_response)),
             }),
         ),
