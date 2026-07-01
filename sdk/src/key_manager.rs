@@ -5,7 +5,7 @@ use encrypted_spaces_backend::error::{Result, SdkError};
 use encrypted_spaces_crypto::Mkem;
 use encrypted_spaces_key_manager::traits::GroupKeySync;
 use encrypted_spaces_key_manager::{
-    DefaultMkem, GkDeliveryEnvelope, InviteRequest, OperationBuilder, RekeyRequest, SimpleKeyId,
+    DefaultMkem, GkDeliveryEnvelope, InviteRequest, OperationBuilder, RekeyRequest,
 };
 pub(crate) type SpacePublicKey = <DefaultMkem as Mkem>::PublicKey;
 
@@ -43,7 +43,7 @@ impl KeyManagerHandle {
             .map_err(|_| SdkError::ValidationError("rekey failed".to_string()))
     }
 
-    pub async fn extend(&self, builder: &mut dyn OperationBuilder) -> Result<SimpleKeyId> {
+    pub async fn extend(&self, builder: &mut dyn OperationBuilder) -> Result<crate::TreeKeyId> {
         let mut km = self.space.key_manager.lock().await;
         km.extend(builder)
             .await
@@ -52,7 +52,7 @@ impl KeyManagerHandle {
 
     pub async fn reduce(
         &self,
-        before: &SimpleKeyId,
+        before: &crate::TreeKeyId,
         builder: &mut dyn OperationBuilder,
     ) -> Result<()> {
         let mut km = self.space.key_manager.lock().await;
@@ -150,7 +150,7 @@ impl Space {
 
     /// Reduce (prune) old retention keys before a given key ID, preventing
     /// access for new users to old data encrypted with keys before that ID.
-    pub async fn reduce(&self, before: SimpleKeyId) -> Result<()> {
+    pub async fn reduce(&self, before: crate::TreeKeyId) -> Result<()> {
         // 1. Build the reduce request via key_manager.
         let mut reduce_builder = self.retention_builder();
         self.key_manager()
@@ -393,7 +393,7 @@ mod tests {
         space.extend().await?;
 
         // Reduce: prune key 0
-        space.reduce(SimpleKeyId(1)).await?;
+        space.reduce(crate::TreeKeyId::root(1)).await?;
 
         // Reading should fail — the row encrypted with key 0 can't be decrypted
         let msgs = read_messages(&space).await?;
@@ -410,7 +410,7 @@ mod tests {
         space.extend().await?;
 
         // Reduce prunes key 0 (no data was written with it)
-        space.reduce(SimpleKeyId(1)).await?;
+        space.reduce(crate::TreeKeyId::root(1)).await?;
 
         // New writes after reduce should work
         insert_message(&space, "post-reduce").await?;
@@ -452,7 +452,7 @@ mod tests {
         space.extend().await?;
 
         // Reduce: prune old keys
-        space.reduce(SimpleKeyId(2)).await?;
+        space.reduce(crate::TreeKeyId::root(2)).await?;
 
         // New data after reduce works
         insert_message(&space, "after reduce").await?;
@@ -557,7 +557,7 @@ mod tests {
         insert_message(&alice, "at key 2").await?;
 
         // Prune key 0 — rows encrypted at key 0 become unreadable for everyone.
-        alice.reduce(SimpleKeyId(1)).await?;
+        alice.reduce(crate::TreeKeyId::root(1)).await?;
 
         // A post-reduce write must still be readable by the whole group.
         insert_message(&alice, "post-reduce").await?;

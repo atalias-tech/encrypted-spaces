@@ -41,6 +41,20 @@ pub struct InviteResult {
 }
 
 // ---------------------------------------------------------------------------
+// Channel-key delivery (L2 read scoping)
+// ---------------------------------------------------------------------------
+
+/// Client -> Server: deliver one channel's key line to its readers. Same mVE
+/// shape as a rekey/invite, but carries a specific channel's HGK so a member is
+/// granted read access to exactly that channel (the L2 read boundary).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChannelDeliveryRequest {
+    pub channel: i64,
+    pub commitment: KeyCommitment,
+    pub proof: PoseidonMveProof<DefaultMkem>,
+}
+
+// ---------------------------------------------------------------------------
 // GK delivery slot
 // ---------------------------------------------------------------------------
 

@@ -28,7 +28,7 @@ use encrypted_spaces_ffproof::EXTEND_FF_ID;
 #[cfg(not(target_arch = "wasm32"))]
 use encrypted_spaces_key_manager::{CollectingOperationBuilder, KeyManager};
 #[cfg(not(target_arch = "wasm32"))]
-use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
+use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
 
 #[cfg(test)]
 use crate::cache::Cache;
@@ -101,7 +101,7 @@ impl Space {
         let key_manager = KeyManager::new(
             user.update_key_pair.clone(),
             user.auth_key_pair.clone(),
-            SimpleLine2SpaceKey::new(&mut stub_builder)
+            TreeSpaceKey::new(&mut stub_builder)
                 .await
                 .expect("stub space key init"),
         );

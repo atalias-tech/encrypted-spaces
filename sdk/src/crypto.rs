@@ -8,7 +8,7 @@ use encrypted_spaces_crypto::encryption::{
     decrypt_row, encrypt_row, EncryptedColumn, EncryptionKey, FieldType,
 };
 use encrypted_spaces_crypto::error::EncryptionError;
-use encrypted_spaces_key_manager::SimpleKeyId;
+use crate::TreeKeyId;
 use std::collections::HashMap;
 
 /// Convert a schema to a list of encrypted columns (those with `plaintext == false`).
@@ -45,6 +45,52 @@ pub(crate) async fn current_encryption_key(space: &Space) -> Result<EncryptionKe
         .map_err(|_| SdkError::DecryptionError("missing key for current key_id".into()))
 }
 
+/// Derive the encryption key for a row in `channel` (L2 read scoping, whitepaper
+/// §4.3/§5.1): the channel's data key is derived from the group key and the
+/// channel — `TreeKeyId{channel, seq}` in the ciphertext header. A full member
+/// derives it from the group key; a member scoped away from `channel` cannot,
+/// so it can't read the row. The epoch `seq` is the current root-line sequence.
+pub(crate) async fn channel_encryption_key(
+    space: &Space,
+    channel: i64,
+) -> Result<EncryptionKey> {
+    let builder = space.retention_builder();
+    let km = space.key_manager.lock().await;
+    // Current epoch sequence (from the root line).
+    let root_id = km
+        .current_key_id(&builder)
+        .await
+        .map_err(|_| SdkError::DecryptionError("current key id failed".into()))?;
+    let key_id = TreeKeyId::new(channel, root_id.seq);
+    km.data_key_for_key_id(&key_id, &builder)
+        .await
+        .map(|bytes| EncryptionKey::new(bytes, &key_id))
+        .map_err(|_| SdkError::DecryptionError("channel key derivation failed".into()))
+}
+
+/// Extract the row's `channel_id` value from an Insert/Update query, if the
+/// table has a plaintext `channel_id` column — the routing key for L2 read
+/// scoping. `None` ⇒ channel-less/global table ⇒ root line.
+fn query_channel_id(operation: &QueryOperation, schema: &Schema) -> Option<i64> {
+    if !schema.columns.iter().any(|c| c.name == "channel_id") {
+        return None;
+    }
+    let fields = match operation {
+        QueryOperation::Insert(f) | QueryOperation::Update(f) => f,
+        _ => return None,
+    };
+    fields.iter().find_map(|(name, param)| {
+        if name == "channel_id" {
+            match param {
+                QueryParam::Integer(v) => Some(*v),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
 /// Encrypt fields in a query's Insert or Update operation, using the current
 /// key from `space`. No-op for Select/Delete or tables without encrypted columns.
 pub(crate) async fn encrypt_query_fields(query: &mut Query, space: &Space) -> Result<()> {
@@ -58,7 +104,12 @@ pub(crate) async fn encrypt_query_fields(query: &mut Query, space: &Space) -> Re
         return Ok(());
     }
 
-    let key = current_encryption_key(space).await?;
+    // Route to the row's channel line (L2 read scoping) when the table carries a
+    // channel_id; otherwise the root line.
+    let key = match query_channel_id(&query.operation, &schema) {
+        Some(channel) => channel_encryption_key(space, channel).await?,
+        None => current_encryption_key(space).await?,
+    };
 
     let is_insert = matches!(query.operation, QueryOperation::Insert(_));
 
@@ -131,7 +182,7 @@ pub(crate) async fn decrypt_table_rows(
     }
     let km = space.key_manager.lock().await;
     let builder = space.retention_builder();
-    let resolver = |key_id: SimpleKeyId| {
+    let resolver = |key_id: TreeKeyId| {
         let km = &km;
         let builder = &builder;
         async move {
@@ -170,7 +221,7 @@ mod tests {
     use encrypted_spaces_backend::query::{Query, QueryOperation, QueryParam};
     use encrypted_spaces_backend::schema::Schema;
     use encrypted_spaces_crypto::encryption::ciphertext_key_id;
-    use encrypted_spaces_key_manager::SimpleKeyId;
+    use crate::TreeKeyId;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
@@ -204,6 +255,115 @@ mod tests {
         let table = space.table::<SecretNote>("notes");
         space.create_table(&notes_schema()?).await?;
         Ok(table)
+    }
+
+    /// A channel-scoped table: plaintext `channel_id` (the L2 routing key) + an
+    /// encrypted `body`.
+    fn msgs_schema() -> Result<Schema> {
+        SchemaBuilder::new("msgs")
+            .column("id", ColumnType::Integer)
+            .plaintext_primary_key()
+            .column("channel_id", ColumnType::Integer)?
+            .plaintext()
+            .column("body", ColumnType::String)?
+            .build()
+    }
+
+    fn insert_body_ciphertext_key_id(query: &Query) -> Option<TreeKeyId> {
+        let fields = match &query.operation {
+            QueryOperation::Insert(f) => f,
+            _ => return None,
+        };
+        let body = fields.iter().find(|(n, _)| n == "body")?;
+        let b64 = match &body.1 {
+            QueryParam::Text(s) => s,
+            _ => return None,
+        };
+        let raw = STANDARD.decode(b64).ok()?;
+        ciphertext_key_id::<TreeKeyId>(&raw)
+    }
+
+    #[tokio::test]
+    async fn channel_rows_encrypt_under_derived_channel_keys() -> Result<()> {
+        let (_, space) = create_space().await?;
+        space.create_table(&msgs_schema()?).await?;
+
+        // No channel setup needed — channel keys are pure derivation (§4.3/§5.1).
+        // A row for channel 1 encrypts under channel 1's derived key...
+        let mut q1 = Query::new(
+            "msgs".to_string(),
+            QueryOperation::Insert(vec![
+                ("id".to_string(), QueryParam::Integer(1)),
+                ("channel_id".to_string(), QueryParam::Integer(1)),
+                ("body".to_string(), QueryParam::Text("secret in ch1".into())),
+            ]),
+        );
+        encrypt_query_fields(&mut q1, &space).await?;
+        assert_eq!(
+            insert_body_ciphertext_key_id(&q1),
+            Some(TreeKeyId::new(1, 0)),
+            "channel-1 row must be tagged with channel 1's key id"
+        );
+
+        // ...and a channel-2 row under channel 2's line.
+        let mut q2 = Query::new(
+            "msgs".to_string(),
+            QueryOperation::Insert(vec![
+                ("id".to_string(), QueryParam::Integer(2)),
+                ("channel_id".to_string(), QueryParam::Integer(2)),
+                ("body".to_string(), QueryParam::Text("secret in ch2".into())),
+            ]),
+        );
+        encrypt_query_fields(&mut q2, &space).await?;
+        assert_eq!(
+            insert_body_ciphertext_key_id(&q2),
+            Some(TreeKeyId::new(2, 0)),
+            "channel-2 row must be tagged with channel 2's key id"
+        );
+
+        // The full member (holds all channel lines) round-trips the channel-1 row.
+        let fields = match &q1.operation {
+            QueryOperation::Insert(f) => f,
+            _ => panic!("expected Insert"),
+        };
+        let mut row = serde_json::Map::new();
+        for (name, param) in fields {
+            let value = match param {
+                QueryParam::Integer(i) => serde_json::Value::Number((*i).into()),
+                QueryParam::Text(s) => serde_json::Value::String(s.clone()),
+                QueryParam::Null => serde_json::Value::Null,
+                _ => panic!("unexpected param type"),
+            };
+            row.insert(name.clone(), value);
+        }
+        let mut rows = vec![serde_json::Value::Object(row)];
+        let schemas = space.with_state(|s| s.table_schemas.clone());
+        decrypt_table_rows(&mut rows, "msgs", &schemas, &space).await?;
+        assert_eq!(
+            rows[0].as_object().unwrap().get("body"),
+            Some(&serde_json::Value::String("secret in ch1".into()))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn any_channel_derives_without_setup() -> Result<()> {
+        let (_, space) = create_space().await?;
+        space.create_table(&msgs_schema()?).await?;
+        // Channel 5 needs no setup — its key is derived on the fly (pure
+        // derivation), tagged with its own channel id (not the root line).
+        let mut q = Query::new(
+            "msgs".to_string(),
+            QueryOperation::Insert(vec![
+                ("id".to_string(), QueryParam::Integer(1)),
+                ("channel_id".to_string(), QueryParam::Integer(5)),
+                ("body".to_string(), QueryParam::Text("secret in ch5".into())),
+            ]),
+        );
+        encrypt_query_fields(&mut q, &space).await?;
+        assert_eq!(insert_body_ciphertext_key_id(&q), Some(TreeKeyId::new(5, 0)));
+        Ok(())
     }
 
     // ── Unit tests for encrypt_query_fields / decrypt_table_rows ────────
@@ -246,8 +406,8 @@ mod tests {
                 .decode(ciphertext_b64)
                 .expect("encrypted field should be valid base64");
             assert_eq!(
-                ciphertext_key_id::<SimpleKeyId>(&raw),
-                Some(SimpleKeyId(0)),
+                ciphertext_key_id::<TreeKeyId>(&raw),
+                Some(TreeKeyId::root(0)),
                 "{col_name} ciphertext should be tagged with key_id 0"
             );
         }
@@ -387,8 +547,8 @@ mod tests {
                 assert_ne!(b64, "world");
                 let raw = STANDARD.decode(b64).expect("should be valid base64");
                 assert_eq!(
-                    ciphertext_key_id::<SimpleKeyId>(&raw),
-                    Some(SimpleKeyId(0)),
+                    ciphertext_key_id::<TreeKeyId>(&raw),
+                    Some(TreeKeyId::root(0)),
                     "{col_name} ciphertext should be tagged with key_id 0"
                 );
             }
@@ -476,7 +636,7 @@ mod tests {
                 let b64 = obj.get("title").and_then(|v| v.as_str()).unwrap();
                 let raw = STANDARD.decode(b64).expect("should be valid base64");
                 assert_eq!(
-                    ciphertext_key_id::<SimpleKeyId>(&raw),
+                    ciphertext_key_id::<TreeKeyId>(&raw),
                     Some(key_id_before.clone()),
                     "row id={id} should be encrypted with initial key_id"
                 );

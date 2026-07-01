@@ -43,6 +43,7 @@ use encrypted_spaces_key_manager::{
     InviteRequest, KeyManagerError, PendingWritesView, RekeyRequest, SpaceKey,
 };
 use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
+use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
 use encrypted_spaces_storage_encoding::{action_storage_key, decode_action_value, hashstore_hash};
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -1561,6 +1562,7 @@ impl SpaceState {
         Ok(())
     }
 
+
     fn server_validation_reduce(
         &self,
         _change: &Change,
@@ -2844,7 +2846,7 @@ impl SpaceState {
         //    one the MVE envelope must be bound to.
         let pre_state = self.retention_reader();
         let canonical_commitment =
-            <SimpleLine2SpaceKey as SpaceKey>::canonical_group_key_commitment(&pre_state)
+            <TreeSpaceKey as SpaceKey>::canonical_group_key_commitment(&pre_state)
                 .await
                 .map_err(|_| {
                     ServerError::Generic(
@@ -3132,7 +3134,7 @@ impl SpaceState {
         let pre_state = self.retention_reader();
         let pending = PendingWritesView::new(&retention_writes);
 
-        <SimpleLine2SpaceKey as SpaceKey>::verify_retention_proofs(
+        <TreeSpaceKey as SpaceKey>::verify_retention_proofs(
             op_type,
             retention_proofs,
             &pre_state,
@@ -3164,7 +3166,7 @@ impl SpaceState {
     ) -> Result<(), ServerError> {
         let retention_writes = extract_retention_writes_from_change(change);
         let pending = PendingWritesView::new(&retention_writes);
-        let canonical = <SimpleLine2SpaceKey as SpaceKey>::canonical_group_key_commitment(&pending)
+        let canonical = <TreeSpaceKey as SpaceKey>::canonical_group_key_commitment(&pending)
             .await
             .map_err(|_| {
                 ServerError::Generic(

@@ -61,14 +61,16 @@ pub use encrypted_spaces_backend::query::Query;
 pub use encrypted_spaces_backend::SpaceId;
 pub use encrypted_spaces_changelog_core::changelog::OpType;
 use encrypted_spaces_key_manager::{CollectingOperationBuilder, GkDeliveryEnvelope, KeyManager};
-// `SimpleKeyId` appears in `Space::reduce(before: SimpleKeyId)` (an
-// unconditional public retention API). Re-export so callers don't need a
-// direct `encrypted_spaces_key_manager` dependency.
-pub use encrypted_spaces_key_manager::SimpleKeyId;
-use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
+// `TreeKeyId` is the key-id type of the tree read plane; it appears in
+// `Space::reduce(before: TreeKeyId)` (an unconditional public retention API).
+// Re-export so callers don't need a direct `encrypted_spaces_retention`
+// dependency.
+pub use encrypted_spaces_retention::tree_keys::TreeKeyId;
+use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
 
-/// Concrete KeyManager type used throughout the SDK.
-pub(crate) type SpaceKeyManager = KeyManager<SimpleLine2SpaceKey>;
+/// Concrete KeyManager type used throughout the SDK — the per-channel tree read
+/// plane (root line + per-channel SimpleLine2 lines).
+pub(crate) type SpaceKeyManager = KeyManager<TreeSpaceKey>;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -194,7 +196,7 @@ impl Space {
         user.id = Some(1);
 
         let mut create_builder = CollectingOperationBuilder::noop();
-        let space_key = SimpleLine2SpaceKey::new(&mut create_builder)
+        let space_key = TreeSpaceKey::new(&mut create_builder)
             .await
             .map_err(|e| SdkError::ValidationError(format!("failed to init space key: {e:?}")))?;
         let create_output = create_builder.finalize();

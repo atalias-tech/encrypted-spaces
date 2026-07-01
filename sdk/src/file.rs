@@ -3,7 +3,7 @@ use encrypted_spaces_backend::error::{Result, SdkError};
 use encrypted_spaces_crypto::encryption::{
     ciphertext_key_id, decrypt_field, encrypt_field, EncryptionKey,
 };
-use encrypted_spaces_key_manager::SimpleKeyId;
+use crate::TreeKeyId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -145,7 +145,7 @@ impl FileHandle {
                 "file content hash mismatch: server returned tampered or wrong data".into(),
             ));
         }
-        let key_id: SimpleKeyId = ciphertext_key_id(&encrypted).ok_or_else(|| {
+        let key_id: TreeKeyId = ciphertext_key_id(&encrypted).ok_or_else(|| {
             SdkError::DecryptionError("invalid file ciphertext: missing key_id".into())
         })?;
         let builder = self.space.retention_builder();

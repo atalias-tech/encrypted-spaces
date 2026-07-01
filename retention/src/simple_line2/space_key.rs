@@ -686,6 +686,13 @@ impl<P: SimpleLine2RuntimeProver> SimpleLine2SpaceKey<P> {
             _prover: std::marker::PhantomData,
         })
     }
+
+    /// The current group key (HGK) — the root of the retention key tree
+    /// (whitepaper §4.2). Used by the tree read plane to derive per-resource
+    /// (channel) keys structurally, per §4.3/§5.1 (`derive(group key, path)`).
+    pub fn current_group_key(&self) -> KeyMaterial {
+        self.hgk.clone()
+    }
 }
 impl<P: SimpleLine2RuntimeProver> SimpleLine2SpaceKey<P> {
     /// Extend the current SL2 chain.

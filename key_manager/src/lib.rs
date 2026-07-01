@@ -33,6 +33,10 @@ pub const REKEY_SESSION_ID: &str = "key-manager-rekey-v1";
 /// Session identifier for the mVE Fiat-Shamir transformation during invites.
 pub const INVITE_SESSION_ID: &str = "key-manager-invite-v1";
 
+/// Session identifier for the mVE Fiat-Shamir transformation during per-channel
+/// key delivery (L2 read scoping).
+pub const CHANNEL_DELIVERY_SESSION_ID: &str = "key-manager-channel-delivery-v1";
+
 // =========================================================================
 // KeyManager
 // =========================================================================
@@ -167,6 +171,18 @@ impl<G: SpaceKey> KeyManager<G> {
     /// key to [`SpaceKey::recover_group_key_from_candidate`] which
     /// reconciles it against the canonical retention snapshot. Both paths
     /// share the same mVE ciphertext + binding-commitment envelope shape.
+    /// Decrypt a delivered key envelope (channel or group key — same mVE shape),
+    /// verifying `commit(key) == commitment`. Used by channel-key delivery: the
+    /// recovered key is installed into a channel line via
+    /// `TreeSpaceKey::install_channel`.
+    pub fn decrypt_delivered_key(
+        &self,
+        ciphertext: &MveRecipientCiphertext<DefaultMkem, KeyMaterial>,
+        commitment: KeyCommitment,
+    ) -> Result<KeyMaterial, KeyManagerError> {
+        self.decrypt_group_key_envelope(ciphertext, commitment)
+    }
+
     pub async fn apply_delivered_group_key(
         &mut self,
         ciphertext: &MveRecipientCiphertext<DefaultMkem, KeyMaterial>,
@@ -338,6 +354,45 @@ pub fn verify_invite(
         std::slice::from_ref(new_member_pk),
         &request.root_commitment,
         INVITE_SESSION_ID,
+    )
+    .map_err(|_| KeyManagerError)
+}
+
+/// mVE-wrap a channel's key line to its readers (L2 read scoping). The caller
+/// supplies the channel's HGK + commitment (from
+/// `TreeSpaceKey::produce_channel_group_key`); this proves the same
+/// multi-recipient envelope shape a rekey uses, bound to a channel-specific
+/// session so it can't be confused with a group-key delivery.
+pub fn prove_channel_delivery(
+    channel: i64,
+    commitment: KeyCommitment,
+    key: &KeyMaterial,
+    recipients: &[<DefaultMkem as Mkem>::PublicKey],
+) -> ChannelDeliveryRequest {
+    let proof = PoseidonMve::<DefaultMkem>::prove(
+        recipients,
+        &commitment,
+        key,
+        CHANNEL_DELIVERY_SESSION_ID,
+    );
+    ChannelDeliveryRequest {
+        channel,
+        commitment,
+        proof,
+    }
+}
+
+/// Verify a channel-delivery mVE proof and return per-recipient ciphertexts.
+/// Stateless — the server calls this before writing channel delivery slots.
+pub fn verify_channel_delivery(
+    recipients: &[<DefaultMkem as Mkem>::PublicKey],
+    request: &ChannelDeliveryRequest,
+) -> Result<MveCiphertext<DefaultMkem, KeyMaterial>, KeyManagerError> {
+    PoseidonMve::<DefaultMkem>::verify(
+        &request.proof,
+        recipients,
+        &request.commitment,
+        CHANNEL_DELIVERY_SESSION_ID,
     )
     .map_err(|_| KeyManagerError)
 }
