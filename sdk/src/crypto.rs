@@ -741,6 +741,54 @@ mod tests {
 
         Ok(())
     }
+
+    /// SECURITY (§8): after a group rekey, a scoped member's delivery slot must
+    /// NOT contain a group-key envelope. If it does, a malicious scoped member
+    /// can fetch and decrypt the group key, defeating L2 read scoping.
+    #[tokio::test]
+    async fn scoped_member_slot_has_no_group_key_after_rekey() -> Result<()> {
+        use encrypted_spaces_key_manager::{GkDeliveryEnvelope, ScopedDeliveryEnvelope};
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Scope an agent to channel 1 only; it joins holding no group key.
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent_uid = invite.id().expect("scoped invite carries a provisional uid");
+        let _agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+
+        // `join` rotates the agent's provisional keypair to a permanent one
+        // (an update to _users made by the *agent's* connection). Alice's
+        // local _users cache only reflects that rotation once her broadcast
+        // listener has processed it, which is not guaranteed by the time
+        // control returns here. Without this, `rekey()` below would build a
+        // group-key ciphertext against the agent's stale (pre-rotation) pk,
+        // and the server's independent re-fetch of _users would fail MVE
+        // verification against the *current* pk -- a race unrelated to the
+        // §8 leak this test targets. Force alice's view to converge first.
+        alice.recover_via_fast_forward().await?;
+
+        // A full member forces a real group rekey (new group key epoch).
+        alice.rekey().await?;
+
+        // Inspect the scoped member's server-side delivery slot directly.
+        let server = transport.server_state();
+        let bytes = server
+            .lock()
+            .await
+            .get_delivery_slot(agent_uid)
+            .expect("scoped member has a delivery slot from its invite");
+
+        assert!(
+            serde_json::from_slice::<GkDeliveryEnvelope>(&bytes).is_err(),
+            "SECURITY LEAK: scoped member's slot contains a GroupKey envelope after rekey"
+        );
+        assert!(
+            serde_json::from_slice::<ScopedDeliveryEnvelope>(&bytes).is_ok(),
+            "scoped member's slot should still hold its ScopedDeliveryEnvelope"
+        );
+        Ok(())
+    }
 }
 
 fn query_param_to_value(param: &QueryParam) -> serde_json::Value {
