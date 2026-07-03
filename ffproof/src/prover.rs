@@ -477,6 +477,27 @@ pub fn prove_ff_chunk(
 /// # Returns
 /// * `true` if proving succeeded or there was nothing to prove
 /// * `false` if proving failed
+/// Trace-generation half of an FF proof: read the tree snapshot and produce the
+/// compact pruned-tree witness bytes. This is the ONLY part that needs the
+/// `merk::Node`, and it is fast (no STARK). Split out so a caller can run it
+/// while holding a lock and then run the slow [`prove_ff_chunk`] off-lock (it
+/// takes only owned data — no `merk::Node`). Returns `None` if nothing is
+/// pending (`proven_up_to` already at the tip).
+pub fn prepare_ff_pruned_tree(
+    changelog: &ChangeLog,
+    change_responses: &[ChangeResponse],
+    tree_snapshot: &merk::Node,
+) -> Result<Option<Vec<u8>>, String> {
+    let start_idx = changelog.proven_up_to;
+    if start_idx >= changelog.num_changes() as usize {
+        return Ok(None);
+    }
+    let steps = extract_input_steps(changelog, change_responses, start_idx, tree_snapshot)
+        .map_err(|e| format!("failed to extract input steps: {e}"))?;
+    let tracer_proof = create_trace(tree_snapshot, &steps);
+    Ok(Some(encode_pruned_compact(&tracer_proof.pruned_tree)))
+}
+
 pub fn update_changelog_proof(
     changelog: &mut ChangeLog,
     change_responses: &[ChangeResponse],
@@ -485,18 +506,12 @@ pub fn update_changelog_proof(
 ) -> Result<(), String> {
     let start_idx = changelog.proven_up_to;
 
-    if start_idx >= changelog.num_changes() as usize {
+    let Some(pruned_tree_bytes) =
+        prepare_ff_pruned_tree(changelog, change_responses, tree_snapshot)?
+    else {
         // Nothing to prove
         return Ok(());
-    }
-
-    let steps = match extract_input_steps(changelog, change_responses, start_idx, tree_snapshot) {
-        Ok(result) => result,
-        Err(e) => return Err(format!("failed to extract input steps: {e}")),
     };
-
-    let tracer_proof = create_trace(tree_snapshot, &steps);
-    let pruned_tree_bytes = encode_pruned_compact(&tracer_proof.pruned_tree);
     let (proof, _stats) = prove_ff_chunk(
         previous_proof,
         changelog,

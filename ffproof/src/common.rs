@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// caller (sourced from the app's trust bundle, typically
 /// `sdk_codegen::FF_GUEST_IMAGE_ID`), not against any value carried in
 /// the proof itself.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FFProof {
     pub io: FastForwardRange,
     pub receipt: Receipt,
