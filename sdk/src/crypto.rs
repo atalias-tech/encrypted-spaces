@@ -45,23 +45,26 @@ pub(crate) async fn current_encryption_key(space: &Space) -> Result<EncryptionKe
         .map_err(|_| SdkError::DecryptionError("missing key for current key_id".into()))
 }
 
+/// Sub-sequence for per-channel data keys. Fixed at 0: a channel's key is
+/// `derive(group key, channel)`, and epoch rotation is already carried by the
+/// group key inside that derivation — so the channel key needs no separate root
+/// sequence. Crucially, this means encrypting a channel row does NOT require the
+/// root line's `current_key_id`, which a **scoped** member (no group key) cannot
+/// obtain — letting scoped agents post to their channels, not only read them.
+const CHANNEL_SUBSEQ: u64 = 0;
+
 /// Derive the encryption key for a row in `channel` (L2 read scoping, whitepaper
 /// §4.3/§5.1): the channel's data key is derived from the group key and the
 /// channel — `TreeKeyId{channel, seq}` in the ciphertext header. A full member
 /// derives it from the group key; a member scoped away from `channel` cannot,
-/// so it can't read the row. The epoch `seq` is the current root-line sequence.
+/// so it can't read the row.
 pub(crate) async fn channel_encryption_key(
     space: &Space,
     channel: i64,
 ) -> Result<EncryptionKey> {
     let builder = space.retention_builder();
     let km = space.key_manager.lock().await;
-    // Current epoch sequence (from the root line).
-    let root_id = km
-        .current_key_id(&builder)
-        .await
-        .map_err(|_| SdkError::DecryptionError("current key id failed".into()))?;
-    let key_id = TreeKeyId::new(channel, root_id.seq);
+    let key_id = TreeKeyId::new(channel, CHANNEL_SUBSEQ);
     km.data_key_for_key_id(&key_id, &builder)
         .await
         .map(|bytes| EncryptionKey::new(bytes, &key_id))
@@ -380,6 +383,50 @@ mod tests {
         assert_eq!(rows.len(), 1, "scoped agent must see only its channel");
         assert_eq!(rows[0].channel_id, 1);
         assert_eq!(rows[0].body, "secret in ch1");
+        Ok(())
+    }
+
+    /// A scoped member (no group key) must be able to WRITE into its channel,
+    /// and both it AND a full member must decrypt that write. This is the
+    /// agent-posts-a-reply path: the scoped writer derives the channel key from
+    /// its delivered subtree key (never `current_key_id`, which needs the group
+    /// key), and the full member derives the same key from the group key.
+    #[tokio::test]
+    async fn scoped_member_writes_and_full_member_reads() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Scope an agent to channel 2 only; it joins with no group key.
+        let invite = alice.invite_user_scoped(&[2]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // The SCOPED agent posts into its channel (the previously-broken path).
+        agent
+            .table::<Msg>("msgs")
+            .insert(&Msg { id: None, channel_id: 2, body: "reply from scoped agent".into() })
+            .execute()
+            .await?;
+
+        // The scoped agent reads back its own post.
+        let seen_by_agent: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert_eq!(seen_by_agent.len(), 1, "scoped writer must read its own post");
+        assert_eq!(seen_by_agent[0].body, "reply from scoped agent");
+
+        // The FULL member (alice, uid 1) decrypts the scoped agent's post —
+        // deriving channel 2's key from the group key must match the agent's
+        // delivered subtree key.
+        let seen_by_alice: Vec<Msg> = alice.table::<Msg>("msgs").select().all().await?;
+        assert_eq!(seen_by_alice.len(), 1, "full member must read scoped member's post");
+        assert_eq!(seen_by_alice[0].channel_id, 2);
+        assert_eq!(seen_by_alice[0].body, "reply from scoped agent");
         Ok(())
     }
 
