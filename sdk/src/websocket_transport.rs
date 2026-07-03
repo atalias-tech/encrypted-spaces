@@ -358,6 +358,17 @@ impl WebSocketTransport {
                     }
                 }
             }
+            // Drain on ANY exit — including a bare stream end (`next()` →
+            // `None`, e.g. the server process died without a close frame),
+            // which the per-arm drains above don't cover. An undrained pending
+            // entry would hang its caller forever.
+            let mut map = pending_clone.lock().await;
+            for (_id, tx) in map.drain() {
+                let _ = tx.send(PendingResponse::Db(Err(SdkError::DatabaseError(
+                    "connection lost".into(),
+                ))));
+            }
+            drop(map);
             log_debug!("read_loop: terminated");
         });
 
@@ -408,10 +419,22 @@ impl WebSocketTransport {
         }
         drop(guard);
 
-        // Await response delivered by read loop
-        let pending_resp = rx
-            .await
-            .map_err(|_| SdkError::DatabaseError("response channel closed".into()))?;
+        // Await response delivered by read loop. Bounded: if the read loop
+        // died between our pending-insert and the send (its drain already ran),
+        // no one will ever fulfil this oneshot — without a timeout the caller
+        // would hang forever on a dead connection.
+        const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let pending_resp = match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
+            Ok(resp) => {
+                resp.map_err(|_| SdkError::DatabaseError("response channel closed".into()))?
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                return Err(SdkError::DatabaseError(format!(
+                    "no response for request {request_id} within {RESPONSE_TIMEOUT:?} (connection dead?)"
+                )));
+            }
+        };
         match pending_resp {
             PendingResponse::Db(result) => {
                 let resp = result?;
