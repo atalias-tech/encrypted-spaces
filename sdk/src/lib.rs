@@ -184,6 +184,18 @@ impl Space {
         self.updates_tx.subscribe()
     }
 
+    /// Proof-pipeline status as this client has **cryptographically verified**
+    /// it: `(current_change_id, verified_up_to)`. `verified_up_to` is the
+    /// highest change covered by a fast-forward STARK receipt this client
+    /// checked itself (trustless — not server-reported). The gap between the
+    /// two is the server's unproven ragged tail: every change in it was still
+    /// individually verified locally (signature + tracer replay), but a
+    /// persistently growing gap means the server's prover is stalled and late
+    /// joiners face an ever-longer replay.
+    pub fn proof_status(&self) -> (u32, u32) {
+        self.with_state(|s| (s.current_change_id, s.verified_up_to))
+    }
+
     /// Create a new space adhering to a schema specification as the initial user.
     ///
     /// Generates a random [`SpaceId`] and coordinated keypairs so the user's
@@ -230,6 +242,7 @@ impl Space {
                 my_last_change_id: 0,
                 sigref_map: BTreeMap::new(),
                 timestamp_hwm: 0,
+                verified_up_to: 0,
                 key_valid_from_change_id: 0,
                 table_schemas,
                 actions,
@@ -378,6 +391,7 @@ impl Space {
                 my_last_change_id: 0,
                 sigref_map: BTreeMap::new(),
                 timestamp_hwm: 0,
+                verified_up_to: 0,
                 key_valid_from_change_id: 0,
                 table_schemas,
                 actions,

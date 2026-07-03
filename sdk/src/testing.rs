@@ -117,6 +117,7 @@ impl Space {
                 my_last_change_id: 0,
                 sigref_map: BTreeMap::new(),
                 timestamp_hwm: 0,
+                verified_up_to: 0,
                 key_valid_from_change_id: 0,
                 table_schemas: HashMap::new(),
                 actions: HashMap::new(),

@@ -2270,6 +2270,11 @@ impl Space {
                 );
             }
 
+            // Record the verified-proof frontier (all checks above passed).
+            self.with_state_mut(|state| {
+                state.verified_up_to = state.verified_up_to.max(proof.end_change_id);
+            });
+
             println!(
                 "Client state updated to change_id {} via verified FF proof",
                 proof.end_change_id

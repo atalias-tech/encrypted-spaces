@@ -53,6 +53,15 @@ pub(crate) struct State {
     /// replay.
     #[serde(default)]
     pub(crate) timestamp_hwm: u64,
+    /// Highest change_id covered by a **verified** fast-forward proof (the
+    /// receipt this client checked against its pinned ImageID). Trails
+    /// `current_change_id` by the server's unproven ragged tail; the gap is a
+    /// client-derived, trustless health signal for the server's proving
+    /// pipeline (a stall means joiners must replay a growing tail). 0 until
+    /// the first proof verifies; legacy snapshots default to 0 and re-learn
+    /// on the next fast-forward.
+    #[serde(default)]
+    pub(crate) verified_up_to: u32,
     /// The change_id at which the current auth key became valid.
     /// Starts at 0 (for the initial key set during CreateSpace/InviteUser).
     /// Updated to the RefreshKeys change_id after each key rotation.
@@ -288,6 +297,7 @@ mod tests {
             my_last_change_id: current_change_id,
             sigref_map: BTreeMap::new(),
             timestamp_hwm: if current_change_id == 0 { 0 } else { 1_000 },
+            verified_up_to: 0,
             key_valid_from_change_id: 0,
             table_schemas: HashMap::new(),
             actions: HashMap::new(),
