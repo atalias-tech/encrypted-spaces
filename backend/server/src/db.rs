@@ -409,14 +409,31 @@ struct CapturedFfInputs {
     space_id: SpaceId,
 }
 
+/// Max prove attempts per batch before parking (the next incoming change
+/// re-triggers). Retries target *transient* failures — CUDA OOM under GPU
+/// contention, driver hiccups, prover panics — with exponential backoff.
+/// Deterministic failures burn through the attempts and then stop hammering
+/// the GPU; the stall is visible to clients as a frozen `verified_up_to`.
+const FF_PROVE_MAX_ATTEMPTS: u32 = 5;
+
+/// Backoff before retry attempt `n` (1-based): 1s, 2s, 4s, 8s, capped at 16s.
+fn ff_prove_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64 << (attempt - 1).min(4))
+}
+
 /// Per-space background FF prover. Woken via `prove_signal` when a batch is due,
 /// it captures inputs under the lock (fast trace-gen), runs the STARK off-lock
 /// on a blocking thread, then re-locks briefly to store the result. The
-/// `proving` guard keeps the recursive proof extension sequential. Exits when
-/// the space is dropped (the weak ref fails to upgrade).
+/// `proving` guard keeps the recursive proof extension sequential. Capture and
+/// prove failures retry with backoff (inputs are re-captured fresh each attempt,
+/// folding in any changes that arrived meanwhile); a finalize failure never
+/// retries the batch — the in-memory chain has already advanced and re-proving
+/// it would violate `set_ff_proof`'s monotonicity. Exits when the space is
+/// dropped (the weak ref fails to upgrade).
 async fn ff_prover_loop(weak: Weak<Mutex<SpaceState>>, signal: Arc<Notify>) {
     loop {
         signal.notified().await;
+        let mut attempt: u32 = 0;
         // Drain every batch that is due (more may arrive while we prove).
         loop {
             let Some(arc) = weak.upgrade() else { return };
@@ -427,20 +444,33 @@ async fn ff_prover_loop(weak: Weak<Mutex<SpaceState>>, signal: Arc<Notify>) {
                 if !state.proving {
                     break;
                 }
-                match state.capture_ff_prove_inputs() {
-                    Ok(inputs) => inputs,
-                    Err(e) => {
-                        log::error!("space={} FF prove capture failed: {e}", state.space_id);
-                        None
-                    }
-                }
+                state.capture_ff_prove_inputs()
             };
-            let Some(captured) = captured else {
-                // Nothing to prove after all — clear the guard and wait.
-                if let Some(arc) = weak.upgrade() {
-                    arc.lock().await.proving = false;
+            let captured = match captured {
+                Ok(Some(inputs)) => inputs,
+                Ok(None) => {
+                    // Nothing to prove after all — clear the guard and wait.
+                    if let Some(arc) = weak.upgrade() {
+                        arc.lock().await.proving = false;
+                    }
+                    break;
                 }
-                break;
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= FF_PROVE_MAX_ATTEMPTS {
+                        log::error!(
+                            "FF prove capture failed after {attempt} attempts: {e}; parking until the next change"
+                        );
+                        if let Some(arc) = weak.upgrade() {
+                            arc.lock().await.proving = false;
+                        }
+                        break;
+                    }
+                    let backoff = ff_prove_backoff(attempt);
+                    log::warn!("FF prove capture failed (attempt {attempt}): {e}; retrying in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
             };
             let CapturedFfInputs {
                 changelog,
@@ -468,19 +498,37 @@ async fn ff_prover_loop(weak: Weak<Mutex<SpaceState>>, signal: Arc<Notify>) {
             let proof_bytes = match proven {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    log::error!("space={space_id} FF prove task failed: {e}");
-                    if let Some(arc) = weak.upgrade() {
-                        arc.lock().await.proving = false;
+                    // A panic inside the prover (e.g. CUDA OOM while the GPU is
+                    // shared with other workloads) lands here as a JoinError —
+                    // contained, and usually transient. Re-capture and retry.
+                    attempt += 1;
+                    if attempt >= FF_PROVE_MAX_ATTEMPTS {
+                        log::error!(
+                            "space={space_id} FF prove failed after {attempt} attempts: {e}; parking until the next change"
+                        );
+                        if let Some(arc) = weak.upgrade() {
+                            arc.lock().await.proving = false;
+                        }
+                        break;
                     }
-                    break;
+                    let backoff = ff_prove_backoff(attempt);
+                    log::warn!(
+                        "space={space_id} FF prove failed (attempt {attempt}): {e}; retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
                 }
             };
+            attempt = 0;
 
             // ── apply (fast, under lock) ──
             let Some(arc) = weak.upgrade() else { return };
             let mut state = arc.lock().await;
             state.changelog.set_ff_proof(proof_bytes, new_proven_up_to);
             if let Err(e) = state.finalize_ff_proof(tree_at_tip) {
+                // In-memory chain is consistent (set_ff_proof succeeded); only
+                // the persisted checkpoint lagged. The next batch's save covers
+                // it — do NOT retry this batch (monotonicity would panic).
                 log::error!("space={space_id} FF proof finalize failed: {e}");
             }
             state.proving = false;
