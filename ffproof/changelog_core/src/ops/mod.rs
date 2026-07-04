@@ -357,8 +357,11 @@ pub(crate) fn partition_composite_entry(
     })
 }
 
+/// Provisional statuses: `Provisional` (0, full invite not yet joined) and
+/// `ScopedProvisional` (3, scoped invite not yet joined). Mirrors
+/// `UserStatus::is_provisional` in the SDK (`sdk/src/users.rs`).
 pub(crate) fn is_provisional_status(status: i64) -> bool {
-    status == 0
+    matches!(status, 0 | 3)
 }
 
 fn parse_i64_column_value(value: &[u8]) -> Option<i64> {
@@ -419,7 +422,7 @@ pub(crate) fn extract_i64_column_from_entry(
 }
 
 /// Read the user's status column via `reader`, verify the user exists, and
-/// enforce provisional user restrictions: provisional users (status == 0)
+/// enforce provisional user restrictions: provisional users (status 0 or 3)
 /// may only perform `RefreshKeys`.
 pub(crate) fn validate_user_access(
     entry: &ChangelogEntry,

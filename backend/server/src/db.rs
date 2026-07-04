@@ -1264,7 +1264,8 @@ impl SpaceState {
         Ok(())
     }
 
-    /// Check if the given user is provisional (status == 0).
+    /// Check if the given user is provisional (status 0 = `Provisional` or
+    /// 3 = `ScopedProvisional`; mirrors `UserStatus::is_provisional` in the SDK).
     pub fn is_provisional_user(&self, uid: i64) -> bool {
         let mut query = Query::new(
             USERS_TABLE_NAME.to_string(),
@@ -1276,11 +1277,13 @@ impl SpaceState {
             values: vec![QueryParam::Integer(uid)],
             cursor_id: None,
         });
-        self.db
-            .query_rows(&query)
-            .ok()
-            .and_then(|rows| rows.first()?.get("status")?.as_i64())
-            == Some(0)
+        matches!(
+            self.db
+                .query_rows(&query)
+                .ok()
+                .and_then(|rows| rows.first()?.get("status")?.as_i64()),
+            Some(0 | 3)
+        )
     }
 
     fn decode_auth_verifying_key(auth_key_b64: &str) -> Result<AuthVerifyingKey, ServerError> {
@@ -1422,7 +1425,7 @@ impl SpaceState {
         })
     }
 
-    /// Provisional users (status == 0) may only submit RefreshKeys changes.
+    /// Provisional users (status 0 or 3) may only submit RefreshKeys changes.
     /// All other op types are rejected until the user
     /// rotates keys and transitions to Full (status == 1).
     fn enforce_provisional_restrictions(&self, change: &ChangelogEntry) -> Result<(), ServerError> {
@@ -4322,6 +4325,90 @@ mod tests {
         state
             .verify_change_signature(&change, &HashedValues::new())
             .unwrap();
+    }
+
+    /// §8 follow-up: a scoped invitee (`UserStatus::ScopedProvisional` = 3) is
+    /// provisional the same as a full invitee (status 0) — it must be
+    /// restricted to RefreshKeys until it rotates keys, exactly like
+    /// `provisional_user_cannot_insert` in sdk/src/lib.rs exercises end-to-end.
+    #[tokio::test]
+    async fn scoped_provisional_user_restricted_to_refresh_keys() {
+        let state = SpaceState::init_server(
+            None,
+            Some(SpaceInitConfig {
+                space_id: SpaceId::random(),
+                artifact_path: None,
+                verbose_logfile: None,
+                bootstrap_data: BootstrapDataSource::None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let auth = AuthContext::new(None, state.space_id);
+        let uid = state
+            .db
+            .insert(
+                Query::new(
+                    USERS_TABLE_NAME.to_string(),
+                    QueryOperation::Insert(vec![
+                        ("update_key".to_string(), QueryParam::Text(String::new())),
+                        ("auth_key".to_string(), QueryParam::Text(String::new())),
+                        // UserStatus::ScopedProvisional = 3 (see sdk/src/users.rs).
+                        ("status".to_string(), QueryParam::Integer(3)),
+                    ]),
+                ),
+                &auth,
+            )
+            .await
+            .unwrap();
+        let uid = u32::try_from(uid).expect("test uid fits in u32");
+
+        assert!(
+            state.is_provisional_user(uid as i64),
+            "status 3 (ScopedProvisional) must count as provisional"
+        );
+
+        // A non-RefreshKeys op (a plain Insert) must be rejected.
+        let label_key = column_key_placeholder("seed_rows", "label");
+        let label_value =
+            serde_json::to_vec(&serde_json::Value::String("seed".to_string())).unwrap();
+        let change = Change::new(
+            OpType::Insert,
+            uid,
+            ROOT_TREE_PATH,
+            &[label_key.as_slice()],
+            &[label_value.as_slice()],
+            0,
+            0,
+            [0u8; 32],
+        )
+        .unwrap();
+
+        let err = state
+            .enforce_provisional_restrictions(&change.entry)
+            .expect_err("scoped-provisional user must be RefreshKeys-restricted");
+        assert!(
+            err.to_string().contains("provisional_user_restricted"),
+            "unexpected error: {err}"
+        );
+
+        // RefreshKeys itself must still be allowed.
+        let refresh_change = Change::new(
+            OpType::RefreshKeys,
+            uid,
+            ROOT_TREE_PATH,
+            &[label_key.as_slice()],
+            &[label_value.as_slice()],
+            0,
+            0,
+            [0u8; 32],
+        )
+        .unwrap();
+        state
+            .enforce_provisional_restrictions(&refresh_change.entry)
+            .expect("RefreshKeys must remain allowed for a scoped-provisional user");
     }
 
     #[tokio::test]

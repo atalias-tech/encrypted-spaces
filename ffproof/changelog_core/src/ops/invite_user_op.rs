@@ -50,11 +50,12 @@ impl OpVerifier for InviteUserOp {
         }
 
         // --- Validate that the status of the new user row is set to provisional ---
+        // (0 = Provisional for a full invite, 3 = ScopedProvisional for a scoped invite).
         let inserted_status =
             extract_i64_column_from_entry(entry, crate::USERS_TABLE, "status", "invite_user")?;
         if !is_provisional_status(inserted_status) {
             return Err(ChangelogError::Generic(format!(
-                "invite_user: inserted _users.status must be provisional (0), got {inserted_status}"
+                "invite_user: inserted _users.status must be provisional (0 or 3), got {inserted_status}"
             )));
         }
 

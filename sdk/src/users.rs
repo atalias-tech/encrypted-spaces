@@ -139,7 +139,7 @@ impl<'de> Deserialize<'de> for UserWithSecrets<DefaultMkem, DefaultSignature> {
 
 /// Membership status for a user in the space.
 ///
-/// Stored as an integer column: `Pending = 0`, `Active = 1`.
+/// Stored as an integer column: Provisional=0, Full=1, Scoped=2, ScopedProvisional=3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
 pub enum UserStatus {
@@ -395,7 +395,7 @@ impl Space {
         //    writes — a scoped invite delivers no group key). _users is plaintext,
         //    so encrypt_query_fields is a no-op even without a group key.
         let mut pending_record = new_user.as_record();
-        pending_record.status = UserStatus::Provisional;
+        pending_record.status = UserStatus::ScopedProvisional;
         let mut insert_builder = self.users().insert(&pending_record);
         insert_builder.take_pending_error()?;
         crate::crypto::encrypt_query_fields(&mut insert_builder.query, self).await?;
