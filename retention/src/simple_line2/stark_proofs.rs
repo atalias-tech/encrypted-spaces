@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use encrypted_spaces_crypto::EncryptedKeyMaterial;
+use encrypted_spaces_crypto::KeyDerivation;
 use encrypted_spaces_crypto::{KeyCommitment, KeyMaterial};
 use encrypted_spaces_key_manager::error::KeyManagerError;
 use encrypted_spaces_zkp::transitions::{
@@ -18,10 +19,14 @@ use encrypted_spaces_zkp::transitions::{
 };
 
 use super::proof::{
-    DefaultDerivation, DeleteKeysProofInput, DeleteKeysSurvivor, DeleteKeysVerifyInput,
-    ExtendProofInput, ExtendVerifyInput, RekeyProofInput, RekeyVerifyInput, SimpleLine2Proofs,
+    ChannelGrantProofInput, ChannelGrantVerifyInput, DefaultDerivation, DeleteKeysProofInput,
+    DeleteKeysSurvivor, DeleteKeysVerifyInput, ExtendProofInput, ExtendVerifyInput,
+    RekeyProofInput, RekeyVerifyInput, SimpleLine2Proofs,
 };
-use super::space_key::{tag, D_DERIVE_TAG, D_HEAD_ENCRYPT_TAG, GB_CHAIN_LINK_TAG, HGK_DERIVE_TAG};
+use super::space_key::{
+    channel_grant_commitment, channel_grant_tag, tag, D_DERIVE_TAG, D_HEAD_ENCRYPT_TAG,
+    GB_CHAIN_LINK_TAG, HGK_DERIVE_TAG,
+};
 
 // ---------------------------------------------------------------------------
 // Transition builders (public data only — shared between prover and verifier)
@@ -131,6 +136,28 @@ fn build_delete_transition(
     Ok(t)
 }
 
+/// Channel-grant transition: a single derive edge proving `channel_key` is
+/// the structural derivation of `group_key` for `channel` (§4.3), rather
+/// than an unrelated or wrongly-labeled key. Mirrors `build_extend_transition`
+/// (commit → derive → commit) but the derive tag is channel-specific
+/// (`channel_grant_tag(channel)`), so a proof for one channel cannot be
+/// replayed to authenticate a different channel's commitment.
+fn build_channel_grant_transition(
+    channel: i64,
+    group_commitment: KeyCommitment,
+    channel_commitment: KeyCommitment,
+) -> KeyTreeTransition {
+    let root = CanonicalPath::new("/sl2-channel-grant");
+    let group_id = root.child("group");
+    let channel_id = root.child("channel_key");
+
+    let mut t = KeyTreeTransition::new();
+    t.commit(group_id.clone(), group_commitment);
+    t.derive(group_id, channel_id.clone(), channel_grant_tag(channel));
+    t.commit(channel_id, channel_commitment);
+    t
+}
+
 // ---------------------------------------------------------------------------
 // Witness builders (private key material — prover only)
 // ---------------------------------------------------------------------------
@@ -176,6 +203,17 @@ fn build_delete_witness(
     for (i, d_key) in d_head_keys.iter().enumerate() {
         keys.insert(root.child(format!("d{}", d_head_seqs[i])), d_key.clone());
     }
+    keys
+}
+
+fn build_channel_grant_witness(
+    group_key: &KeyMaterial,
+    channel_key: &KeyMaterial,
+) -> HashMap<CanonicalPath, KeyMaterial> {
+    let root = CanonicalPath::new("/sl2-channel-grant");
+    let mut keys = HashMap::new();
+    keys.insert(root.child("group"), group_key.clone());
+    keys.insert(root.child("channel_key"), channel_key.clone());
     keys
 }
 
@@ -250,6 +288,7 @@ impl SimpleLine2Proofs<DefaultDerivation> for StarkProver {
     type ExtendProof = Vec<u8>;
     type RekeyProof = Vec<u8>;
     type DeleteKeysProof = Vec<u8>;
+    type ChannelGrantProof = Vec<u8>;
     type Error = KeyManagerError;
 
     fn prove_extend(
@@ -341,6 +380,34 @@ impl SimpleLine2Proofs<DefaultDerivation> for StarkProver {
         )?;
         verify_transition(&transition, proof).map_err(|_| KeyManagerError)
     }
+
+    fn prove_channel_grant(
+        &self,
+        input: ChannelGrantProofInput<'_, DefaultDerivation>,
+    ) -> Result<Self::ChannelGrantProof, Self::Error> {
+        let group_commitment = input.derivation.commit(&input.group_key);
+        let channel_commitment = input.derivation.commit(&input.channel_key);
+        let transition = build_channel_grant_transition(
+            input.channel,
+            group_commitment,
+            channel_commitment,
+        );
+        let keys = build_channel_grant_witness(&input.group_key, &input.channel_key);
+        Ok(prove_transition(input.derivation, &transition, &keys))
+    }
+
+    fn verify_channel_grant(
+        &self,
+        input: ChannelGrantVerifyInput,
+        proof: &[u8],
+    ) -> Result<(), Self::Error> {
+        let transition = build_channel_grant_transition(
+            input.channel,
+            input.group_commitment,
+            input.channel_commitment,
+        );
+        verify_transition(&transition, proof).map_err(|_| KeyManagerError)
+    }
 }
 
 impl super::proof::SimpleLine2RuntimeProver for StarkProver {
@@ -397,7 +464,7 @@ impl super::proof::SimpleLine2RuntimeProver for StarkProver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use encrypted_spaces_crypto::KeyDerivation;
+    use crate::tree_keys::channel_root;
 
     fn derivation() -> DefaultDerivation {
         DefaultDerivation::default()
@@ -766,5 +833,105 @@ mod tests {
         let wrong_transition =
             build_extend_transition(d.commit(&current_d), d.commit(&KeyMaterial::random()));
         assert!(verify_transition(&wrong_transition, &proof).is_err());
+    }
+
+    // --- ChannelGrant (§4.3 read scoping: group key -> channel key) ---
+
+    #[test]
+    fn channel_grant_commitment_matches_manual_derivation() {
+        let d = derivation();
+        let group_key = KeyMaterial::random();
+        let channel = 5i64;
+
+        let expected = d.commit(&channel_root(&group_key, channel));
+        assert_eq!(channel_grant_commitment(&group_key, channel), expected);
+    }
+
+    #[test]
+    #[ignore = "slow STARK proof coverage; run with cargo test -- --ignored"]
+    fn channel_grant_proof_roundtrips_and_rejects_wrong_commitment() {
+        let derivation = DefaultDerivation::default();
+        let group_key = KeyMaterial::random();
+        let channel = 3i64;
+        let channel_key = channel_root(&group_key, channel);
+        let group_commitment = derivation.commit(&group_key);
+        let channel_commitment = derivation.commit(&channel_key);
+
+        let prover = StarkProver;
+        let proof = prover
+            .prove_channel_grant(ChannelGrantProofInput {
+                derivation: &derivation,
+                group_key: group_key.clone(),
+                channel,
+                channel_key: channel_key.clone(),
+            })
+            .expect("prove");
+
+        // Correct commitments verify.
+        prover
+            .verify_channel_grant(
+                ChannelGrantVerifyInput {
+                    channel,
+                    group_commitment,
+                    channel_commitment,
+                },
+                &proof,
+            )
+            .expect("verify ok");
+
+        // A wrong channel_commitment (not the real derivation) is REJECTED.
+        let bogus = derivation.commit(&KeyMaterial::random());
+        assert!(
+            prover
+                .verify_channel_grant(
+                    ChannelGrantVerifyInput {
+                        channel,
+                        group_commitment,
+                        channel_commitment: bogus,
+                    },
+                    &proof,
+                )
+                .is_err(),
+            "a channel commitment that is not derived from the group key must be rejected"
+        );
+    }
+
+    #[test]
+    #[ignore = "slow STARK proof coverage; run with cargo test -- --ignored"]
+    fn channel_grant_proof_rejects_wrong_channel_id() {
+        let derivation = DefaultDerivation::default();
+        let group_key = KeyMaterial::random();
+        let channel = 3i64;
+        let channel_key = channel_root(&group_key, channel);
+        let group_commitment = derivation.commit(&group_key);
+        let channel_commitment = derivation.commit(&channel_key);
+
+        let prover = StarkProver;
+        let proof = prover
+            .prove_channel_grant(ChannelGrantProofInput {
+                derivation: &derivation,
+                group_key: group_key.clone(),
+                channel,
+                channel_key: channel_key.clone(),
+            })
+            .expect("prove");
+
+        // Same (correct) commitments, but claiming a different channel id, is
+        // REJECTED: the tag baked into the proof is channel-specific, so
+        // claiming channel 4 for a proof built over channel 3 must fail even
+        // though the commitments themselves are unchanged.
+        assert!(
+            prover
+                .verify_channel_grant(
+                    ChannelGrantVerifyInput {
+                        channel: channel + 1,
+                        group_commitment,
+                        channel_commitment,
+                    },
+                    &proof,
+                )
+                .is_err(),
+            "a proof for one channel must not verify for a different channel id"
+        );
     }
 }
