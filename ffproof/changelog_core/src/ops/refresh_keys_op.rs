@@ -1361,6 +1361,85 @@ mod tests {
         );
     }
 
+    /// C1 exploit variant with the decoy at a HIGHER row_id than the signer
+    /// (row 999 sorts *last* by key order, not first). This mirrors
+    /// `test_status_escalation_decoy_row_rejected` but flips which row is the
+    /// key-order "head": here the signer's own real row (5) sorts first and
+    /// the decoy (999) sorts last. The rejection must not depend on decoy
+    /// ordering — a future refactor that only re-checks a sorted head column
+    /// (assuming the decoy is always first) would wrongly accept this case.
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok`. GREEN after: `Err`.
+    #[test]
+    fn test_status_escalation_higher_rowid_decoy_rejected() {
+        let uid = 5u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let mut user_kvs = vec![
+            // DECOY: row 999 sorts last by key order, unlike the low-row-id
+            // decoy above — proves rejection is independent of decoy position.
+            KvData {
+                key: column_key("_users", 999, "status"),
+                value: stored_i64(2),
+            },
+            // REAL escalation: the attacker's own row → Full(1).
+            KvData {
+                key: column_key("_users", uid as i64, "status"),
+                value: stored_i64(1),
+            },
+            KvData {
+                key: column_key("_users", uid as i64, "update_key"),
+                value: vec![0xAA; 32],
+            },
+        ];
+        user_kvs.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut entries = kh_kvs;
+        entries.extend(user_kvs);
+        let entry = ChangelogEntry {
+            timestamp: 1000,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::RefreshKeys,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        };
+
+        // Attacker is Scoped(2). Supply the full read sequence the vulnerable
+        // path consumes (two status reads + semantic reads) so that, pre-fix,
+        // E&V runs to completion and returns Ok — proving the bypass.
+        let sk = user_status_key(uid);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+        ];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(
+            result.is_err(),
+            "C1: multi-row _users write with a higher-row-id decoy status \
+             row must be rejected, got Ok (escalation succeeded)"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("single (table, row_id)")
+                || msg.contains("signer's own row")
+                || msg.contains("status transition"),
+            "expected a row-binding / transition rejection, got: {msg}"
+        );
+    }
+
     /// A RefreshKeys whose `_users` write targets a DIFFERENT uid's row
     /// (row_id != entry.uid) is rejected: RefreshKeys may only rotate the
     /// signer's own row. RED before fix (the old table-only check accepts a
