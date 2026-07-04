@@ -67,10 +67,16 @@ impl Space {
     pub async fn rekey(&self) -> Result<()> {
         use crate::users::UserRecord;
 
-        // 1. Gather all current member public keys.
+        // 1. Gather group-key recipient public keys: all members MINUS scoped
+        //    members. Scoped members (L2) must never receive the group key, so
+        //    they are excluded from the rekey recipient set. Row order is
+        //    preserved so it matches the server's identically-filtered order.
         let all_users: Vec<UserRecord> = self.users().select().all().await?;
-        let remaining_pks: Vec<SpacePublicKey> =
-            all_users.iter().map(|u| u.update_key.clone()).collect();
+        let remaining_pks: Vec<SpacePublicKey> = all_users
+            .iter()
+            .filter(|u| !u.status.is_scoped())
+            .map(|u| u.update_key.clone())
+            .collect();
 
         // 2. Build the rekey request via key_manager.
         let mut rekey_builder = self.retention_builder();

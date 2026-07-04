@@ -204,6 +204,13 @@ fn removed_user_ids_in_change(delete_change: &ChangelogEntry) -> BTreeSet<i64> {
         .collect()
 }
 
+/// A `_users.status` value denotes a scoped (L2) member: `Scoped = 2` or
+/// `ScopedProvisional = 3`. Scoped members remain members but must NEVER
+/// receive the group key, so they are excluded from rekey delivery.
+fn status_is_scoped(status: i64) -> bool {
+    status == 2 || status == 3
+}
+
 /// Pull the table name from the first parseable column key in `change`.
 /// Used to derive the target table for ops where the entry encodes it
 /// (Insert / Update / Delete / list ops).
@@ -3255,14 +3262,15 @@ impl SpaceState {
             .select_table_rows_resolving_hashes(USERS_TABLE_NAME, &users_schema)
             .await?;
 
-        let uid_to_pk: HashMap<i64, <DefaultMkem as Mkem>::PublicKey> = rows
+        let uid_to_pk: HashMap<i64, (<DefaultMkem as Mkem>::PublicKey, i64)> = rows
             .iter()
             .filter_map(|row| {
                 let id = row.get("id")?.as_i64()?;
                 let b64 = row.get("update_key")?.as_str()?;
                 let json_bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
                 let pk = serde_json::from_slice(&json_bytes).ok()?;
-                Some((id, pk))
+                let status = row.get("status")?.as_i64()?;
+                Some((id, (pk, status)))
             })
             .collect();
 
@@ -3284,18 +3292,21 @@ impl SpaceState {
             )));
         }
 
-        let remaining_members: Vec<(i64, <DefaultMkem as Mkem>::PublicKey)> = remaining_uids
+        // Group-key recipients = survivors who are NOT scoped. Scoped members
+        // remain members (in remaining_uids, validated above) but must never
+        // receive the group key, so they are excluded from the rekey delivery.
+        // We iterate `remaining_uids` (the client-provided survivor order) and
+        // apply the same `!is_scoped` filter the SDK applied, so both sides
+        // produce the identical recipient ordering the MVE proof is bound to.
+        let gk_recipients: Vec<(i64, <DefaultMkem as Mkem>::PublicKey)> = remaining_uids
             .iter()
-            .map(|&uid| {
-                uid_to_pk
-                    .get(&uid)
-                    .map(|pk| (uid, pk.clone()))
-                    .ok_or_else(|| ServerError::Generic(format!("uid {uid} not found in _users")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|uid| uid_to_pk.get(uid).map(|(pk, st)| (*uid, pk.clone(), *st)))
+            .filter(|(_, _, st)| !status_is_scoped(*st))
+            .map(|(uid, pk, _)| (uid, pk))
+            .collect();
 
-        // 2. Verify the rekey MVE proof.
-        let pks: Vec<_> = remaining_members.iter().map(|(_, pk)| pk.clone()).collect();
+        // 2. Verify the rekey MVE proof over the non-scoped recipient set.
+        let pks: Vec<_> = gk_recipients.iter().map(|(_, pk)| pk.clone()).collect();
         let ciphertexts = verify_rekey(&pks, request)
             .map_err(|_| ServerError::Generic("rekey MVE verification failed".to_string()))?;
 
@@ -3327,10 +3338,12 @@ impl SpaceState {
             self.key_delivery_slots.remove(row_id);
         }
 
-        // 8. Refresh each remaining member's GK delivery slot with their
-        //    rekey envelope. Slot writes are best-effort; the canonical
-        //    retention mutation has already committed above.
-        for (i, (uid, _)) in remaining_members.iter().enumerate() {
+        // 8. Refresh each non-scoped recipient's GK delivery slot with their
+        //    rekey envelope. Scoped members are skipped, so their existing
+        //    (channel-key-only) slots are left untouched. Slot writes are
+        //    best-effort; the canonical retention mutation has already
+        //    committed above.
+        for (i, (uid, _)) in gk_recipients.iter().enumerate() {
             let ciphertext = ciphertexts.get(i).ok_or_else(|| {
                 ServerError::Generic(format!("missing ciphertext for member index {i}"))
             })?;
@@ -3386,10 +3399,19 @@ impl SpaceState {
                 .select_table_rows_resolving_hashes(USERS_TABLE_NAME, &users_schema)
                 .await?;
 
+            // Group-key recipients = all members MINUS scoped members. Scoped
+            // members (L2) must never receive the group key. We filter the
+            // `_users` rows in row order with the same `!is_scoped` rule the SDK
+            // (`Space::rekey`) applies to its `_users` cache, so both sides
+            // produce the identical recipient ordering the MVE proof is bound to.
             let members: Vec<(i64, <DefaultMkem as Mkem>::PublicKey)> = rows
                 .iter()
                 .filter_map(|row| {
                     let id = row.get("id")?.as_i64()?;
+                    let status = row.get("status")?.as_i64()?;
+                    if status_is_scoped(status) {
+                        return None;
+                    }
                     let b64 = row.get("update_key")?.as_str()?;
                     let json_bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
                     let pk = serde_json::from_slice(&json_bytes).ok()?;

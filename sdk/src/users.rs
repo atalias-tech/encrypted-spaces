@@ -460,16 +460,26 @@ impl Space {
         let remaining: Vec<&UserRecord> =
             all_users.iter().filter(|u| u.id != Some(user_id)).collect();
 
-        // 3. Collect remaining PKs and UIDs (same order)
-        let remaining_pks: Vec<SpacePublicKey> =
-            remaining.iter().map(|u| u.update_key.clone()).collect();
+        // 3. Two DISTINCT sets over the same `remaining` ordering:
+        //    - Survivor set (membership): ALL survivors. Passed to the server
+        //      as `remaining_uids` for the survivor-integrity check. Scoped
+        //      members remain members, so they stay here.
+        //    - Group-key recipient set: survivors MINUS scoped members. Scoped
+        //      members (L2) must never receive the group key, so they are
+        //      excluded from the rekey recipients. Row order is preserved so it
+        //      matches the server's identically-filtered order.
         let remaining_uids: Vec<i64> = remaining.iter().map(|u| u.id.unwrap_or(0)).collect();
+        let recipient_pks: Vec<SpacePublicKey> = remaining
+            .iter()
+            .filter(|u| !u.status.is_scoped())
+            .map(|u| u.update_key.clone())
+            .collect();
 
-        // 4. Generate the rekey request for remaining members
+        // 4. Generate the rekey request for the non-scoped recipients
         let mut rekey_builder = self.retention_builder();
         let delete_request = self
             .key_manager()
-            .rekey(&remaining_pks, &mut rekey_builder)
+            .rekey(&recipient_pks, &mut rekey_builder)
             .await?;
         let rekey_output = rekey_builder.finalize();
         let rekey_retention_writes = rekey_output.writes;
