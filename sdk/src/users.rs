@@ -619,6 +619,20 @@ impl Space {
             (b64, kv, ml)
         };
 
+        // The status this rotation stamps depends on the member's read plane:
+        // a full member (holds the group key) becomes `Full`; a scoped member
+        // (L2 — holds only channel subtree keys, no group key) becomes `Scoped`,
+        // so it can never be mistaken for a full member. The guest op-verifier
+        // proves this transition is respected (see `refresh_keys_op.rs`).
+        let rotated_status = {
+            let km = self.key_manager.lock().await;
+            if km.space_key().is_full() {
+                UserStatus::Full
+            } else {
+                UserStatus::Scoped
+            }
+        };
+
         // Build _users update query
         let mut users_query = Query::new(
             USERS_TABLE_NAME.to_string(),
@@ -627,7 +641,7 @@ impl Space {
                 ("auth_key".to_string(), QueryParam::Text(auth_key_str)),
                 (
                     "status".to_string(),
-                    QueryParam::Integer(UserStatus::Full as i64),
+                    QueryParam::Integer(rotated_status as i64),
                 ),
             ]),
         );

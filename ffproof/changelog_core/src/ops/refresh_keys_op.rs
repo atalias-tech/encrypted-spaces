@@ -1,9 +1,9 @@
 use super::{
     append_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
-    derive_column_keys_with_row_id, extract_i64_from_kh_entries, extract_value_from_kh_entries,
-    partition_composite_entry, read_kh_ranges_indexed, read_next_id, table_from_column_keys,
-    validate_key_history_entries, validate_sorted_entries, validate_user_access, OpContext,
-    OpReader, OpVerifier, OpVerifyResult,
+    derive_column_keys_with_row_id, extract_i64_column_from_entry, extract_i64_from_kh_entries,
+    extract_value_from_kh_entries, partition_composite_entry, read_kh_ranges_indexed, read_next_id,
+    read_user_status, table_from_column_keys, validate_key_history_entries, validate_sorted_entries,
+    validate_user_access, OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{ReadOp, TraceStep};
@@ -51,6 +51,42 @@ impl OpVerifier for RefreshKeysOp {
         }
 
         validate_user_access(entry, OpType::RefreshKeys, "refresh_keys", reader)?;
+
+        // L2 membership-lane immutability: when a RefreshKeys updates the
+        // `_users.status` marker it may only move Provisional(0)→Full(1) or
+        // ScopedProvisional(3)→Scoped(2), and may not change an already-joined
+        // member's lane (Full stays Full, Scoped stays Scoped). This forbids any
+        // scoped→Full escalation and is PROVEN, so an untrusted server cannot
+        // land a forged transition in an honest client's verified changelog.
+        // `matches!(old, 2 | 3)` here mirrors `UserStatus::is_scoped` in the SDK.
+        //
+        // Guard: only enforce when the entry actually updates `status`. A
+        // rotation that touches only update_key/auth_key leaves status unchanged,
+        // which is always valid — do not read/reject in that case.
+        let users_column_names = column_names_from_keys(
+            &users_entries
+                .iter()
+                .map(|kv| kv.key.clone())
+                .collect::<Vec<_>>(),
+        );
+        if users_column_names.contains("status") {
+            let old_status =
+                read_user_status(entry.uid, "refresh_keys", reader)?.ok_or_else(|| {
+                    ChangelogError::Generic(format!(
+                        "refresh_keys: could not read current status for uid={}",
+                        entry.uid
+                    ))
+                })?;
+            let new_status =
+                extract_i64_column_from_entry(entry, USERS_TABLE, "status", "refresh_keys")?;
+            let required = if matches!(old_status, 2 | 3) { 2 } else { 1 };
+            if new_status != required {
+                return Err(ChangelogError::Generic(format!(
+                    "refresh_keys: status transition violation \
+                     (old={old_status}, required={required}, got={new_status})"
+                )));
+            }
+        }
 
         // Read the authenticated _key_history next-id counter and derive
         // the real _key_history column keys from the placeholder keys.
@@ -269,6 +305,43 @@ mod tests {
                 entries,
             },
             sig_ref,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        }
+    }
+
+    /// Build a combined entry whose `_users` update carries both an opaque
+    /// `update_key` and a `status` column set to `new_status` (properly encoded
+    /// as an i64 so the transition check can decode it). Used by the
+    /// status-transition tests. First rotation (sig_ref=0).
+    fn make_combined_entry_with_status(
+        uid: u32,
+        kh_kvs: Vec<KvData>,
+        new_status: i64,
+    ) -> ChangelogEntry {
+        let mut user_kvs = vec![
+            KvData {
+                key: column_key("_users", uid as i64, "update_key"),
+                value: vec![0xAA; 32],
+            },
+            KvData {
+                key: column_key("_users", uid as i64, "status"),
+                value: stored_i64(new_status),
+            },
+        ];
+        user_kvs.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut entries = kh_kvs;
+        entries.extend(user_kvs);
+        ChangelogEntry {
+            timestamp: 1000,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::RefreshKeys,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
             parent_clc: [0u8; 32],
             signature: vec![],
         }
@@ -1024,5 +1097,154 @@ mod tests {
             msg.contains("expected the placeholder row_id=0"),
             "unexpected error: {msg}"
         );
+    }
+
+    // ── Status-transition immutability (L2 membership lane) ──────────────
+    //
+    // A RefreshKeys that updates `_users.status` may only land the lawful
+    // join transition: Provisional(0)→Full(1) or ScopedProvisional(3)→
+    // Scoped(2), and may not move an already-joined member between lanes.
+    // This is the PROVEN barrier that stops an untrusted server from forging
+    // a scoped→Full escalation. Note the current status is read *twice*
+    // (validate_user_access + the transition check), so two status ProvenReads
+    // are supplied up front, matching the verifier's read order.
+
+    /// 0→1 (Provisional → Full) is the lawful full-member join; accepted.
+    #[test]
+    fn test_status_transition_provisional_to_full_accepted() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 1);
+
+        let sk = user_status_key(uid);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(0))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(0))],
+            },
+        ];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    /// 3→2 (ScopedProvisional → Scoped) is the lawful scoped-member join; accepted.
+    #[test]
+    fn test_status_transition_scoped_provisional_to_scoped_accepted() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 2);
+
+        let sk = user_status_key(uid);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(3))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(3))],
+            },
+        ];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    /// 2→1 (Scoped → Full) is a forbidden escalation; rejected.
+    #[test]
+    fn test_status_transition_scoped_to_full_rejected() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 1);
+
+        let sk = user_status_key(uid);
+        // Two status reads; the check rejects before any further reads.
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(2))],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("status transition violation")
+                && msg.contains("old=2")
+                && msg.contains("required=2")
+                && msg.contains("got=1"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// 3→1 (ScopedProvisional → Full) is a forbidden scoped→Full escalation; rejected.
+    #[test]
+    fn test_status_transition_scoped_provisional_to_full_rejected() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 1);
+
+        let sk = user_status_key(uid);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(3))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(3))],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("status transition violation")
+                && msg.contains("old=3")
+                && msg.contains("required=2")
+                && msg.contains("got=1"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// A RefreshKeys that rotates keys without updating `status` leaves the
+    /// membership lane unchanged — always valid, and the transition check is
+    /// skipped (no extra status ProvenRead is consumed).
+    #[test]
+    fn test_status_transition_absent_status_accepted() {
+        let uid = 1u32;
+        // Only update_key in the _users update; no status column.
+        let user_col = column_key("_users", uid as i64, "update_key");
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry(uid, kh_kvs, std::slice::from_ref(&user_col));
+
+        // A single status read (validate_user_access); the transition check is
+        // skipped because the entry does not touch `status`. Old status here is
+        // Scoped(2) — a scoped member rotating only its keys must be accepted.
+        let sk = user_status_key(uid);
+        let mut reads = vec![ProvenRead {
+            op: ReadOp::Key(sk.clone()),
+            results: vec![(sk, stored_i64(2))],
+        }];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
     }
 }
