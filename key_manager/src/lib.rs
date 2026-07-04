@@ -1,3 +1,4 @@
+pub mod channel_grant;
 pub mod error;
 pub mod no_retention;
 pub mod operation;
