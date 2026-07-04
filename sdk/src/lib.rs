@@ -1903,6 +1903,8 @@ mod tests {
                     status: match user.status {
                         UserStatus::Provisional => "pending".to_string(),
                         UserStatus::Full => "member".to_string(),
+                        UserStatus::Scoped => "scoped".to_string(),
+                        UserStatus::ScopedProvisional => "scoped_provisional".to_string(),
                     },
                 }
             })

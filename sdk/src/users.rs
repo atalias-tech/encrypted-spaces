@@ -121,6 +121,8 @@ impl<'de> Deserialize<'de> for UserWithSecrets<DefaultMkem, DefaultSignature> {
         let status = match helper.status {
             0 => Ok(UserStatus::Provisional),
             1 => Ok(UserStatus::Full),
+            2 => Ok(UserStatus::Scoped),
+            3 => Ok(UserStatus::ScopedProvisional),
             other => Err(serde::de::Error::custom(format!(
                 "unknown UserStatus value: {other}"
             ))),
@@ -141,10 +143,27 @@ impl<'de> Deserialize<'de> for UserWithSecrets<DefaultMkem, DefaultSignature> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
 pub enum UserStatus {
-    /// Invited but has not yet called [`Space::join`].
+    /// Full invite issued; invitee has not yet called [`Space::join`].
     Provisional = 0,
-    /// Has accepted the invite and rotated to permanent keypairs.
+    /// Joined and holds the group key (full read access).
     Full = 1,
+    /// Joined with L2 read scoping: holds only delivered channel subtree keys,
+    /// never the group key. Excluded from group-key rekey delivery.
+    Scoped = 2,
+    /// Scoped invite issued; invitee has not yet joined. Provisional-restricted
+    /// (RefreshKeys only) and excluded from group-key rekey delivery.
+    ScopedProvisional = 3,
+}
+
+impl UserStatus {
+    /// Members that must never receive the group key on rekey (L2 scoped).
+    pub fn is_scoped(self) -> bool {
+        matches!(self, UserStatus::Scoped | UserStatus::ScopedProvisional)
+    }
+    /// Has not yet completed key rotation → restricted to RefreshKeys.
+    pub fn is_provisional(self) -> bool {
+        matches!(self, UserStatus::Provisional | UserStatus::ScopedProvisional)
+    }
 }
 
 impl Serialize for UserStatus {
@@ -159,6 +178,8 @@ impl<'de> Deserialize<'de> for UserStatus {
         match value {
             0 => Ok(UserStatus::Provisional),
             1 => Ok(UserStatus::Full),
+            2 => Ok(UserStatus::Scoped),
+            3 => Ok(UserStatus::ScopedProvisional),
             other => Err(serde::de::Error::custom(format!(
                 "unknown UserStatus value: {other}"
             ))),
@@ -894,6 +915,11 @@ mod tests {
     fn user_status_serializes_to_expected_integers() {
         assert_eq!(serde_json::to_value(UserStatus::Provisional).unwrap(), 0);
         assert_eq!(serde_json::to_value(UserStatus::Full).unwrap(), 1);
+        assert_eq!(serde_json::to_value(UserStatus::Scoped).unwrap(), 2);
+        assert_eq!(
+            serde_json::to_value(UserStatus::ScopedProvisional).unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -902,11 +928,15 @@ mod tests {
         assert_eq!(prov, UserStatus::Provisional);
         let full: UserStatus = serde_json::from_value(serde_json::json!(1)).unwrap();
         assert_eq!(full, UserStatus::Full);
+        let scoped: UserStatus = serde_json::from_value(serde_json::json!(2)).unwrap();
+        assert_eq!(scoped, UserStatus::Scoped);
+        let scoped_prov: UserStatus = serde_json::from_value(serde_json::json!(3)).unwrap();
+        assert_eq!(scoped_prov, UserStatus::ScopedProvisional);
     }
 
     #[test]
     fn user_status_rejects_unknown_integer() {
-        let err = serde_json::from_value::<UserStatus>(serde_json::json!(2)).unwrap_err();
+        let err = serde_json::from_value::<UserStatus>(serde_json::json!(4)).unwrap_err();
         assert!(
             err.to_string().contains("unknown UserStatus value"),
             "unexpected error: {err}"
