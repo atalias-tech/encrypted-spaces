@@ -24,8 +24,7 @@ use super::proof::{
     RekeyProofInput, RekeyVerifyInput, SimpleLine2Proofs,
 };
 use super::space_key::{
-    channel_grant_commitment, channel_grant_tag, tag, D_DERIVE_TAG, D_HEAD_ENCRYPT_TAG,
-    GB_CHAIN_LINK_TAG, HGK_DERIVE_TAG,
+    channel_grant_tag, tag, D_DERIVE_TAG, D_HEAD_ENCRYPT_TAG, GB_CHAIN_LINK_TAG, HGK_DERIVE_TAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -464,6 +463,7 @@ impl super::proof::SimpleLine2RuntimeProver for StarkProver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::space_key::channel_grant_commitment;
     use crate::tree_keys::channel_root;
 
     fn derivation() -> DefaultDerivation {
