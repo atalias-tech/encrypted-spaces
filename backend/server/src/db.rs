@@ -3298,6 +3298,12 @@ impl SpaceState {
         // We iterate `remaining_uids` (the client-provided survivor order) and
         // apply the same `!is_scoped` filter the SDK applied, so both sides
         // produce the identical recipient ordering the MVE proof is bound to.
+        //
+        // `filter_map`'s silent drop of a `uid` missing from `uid_to_pk` is
+        // safe only because the survivor-integrity check just above already
+        // guarantees `requested_survivors == expected_survivors`, i.e. every
+        // `remaining_uid` here is a key in `uid_to_pk` — this is a defensive
+        // no-op, not a path that can silently narrow the recipient set.
         let gk_recipients: Vec<(i64, <DefaultMkem as Mkem>::PublicKey)> = remaining_uids
             .iter()
             .filter_map(|uid| uid_to_pk.get(uid).map(|(pk, st)| (*uid, pk.clone(), *st)))

@@ -789,6 +789,132 @@ mod tests {
         );
         Ok(())
     }
+
+    /// SECURITY (§8, remove-path): the leak test above only drives the
+    /// standalone-rekey trigger (`handle_retention`). A member removal is the
+    /// *other* path that forces a group rekey (`handle_remove_member`) — a
+    /// scoped survivor of that rekey must be just as excluded from group-key
+    /// delivery as a survivor of a standalone rekey.
+    #[tokio::test]
+    async fn scoped_member_slot_has_no_group_key_after_member_removal() -> Result<()> {
+        use encrypted_spaces_key_manager::{GkDeliveryEnvelope, ScopedDeliveryEnvelope};
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Scope an agent to channel 1 only; it joins holding no group key.
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent_uid = invite.id().expect("scoped invite carries a provisional uid");
+        let _agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+
+        // A throwaway FULL member, whose later removal is what triggers the
+        // rekey under test (not the scoped agent itself).
+        let full_invite = alice.invite_user().await?;
+        let throwaway_uid = full_invite.user.id.expect("full invite carries a uid");
+        let _throwaway = crate::Space::join(transport.clone(), full_invite, schema()).await?;
+
+        // Converge alice's `_users` cache on both members' post-join key
+        // rotations before she builds the removal's rekey (same reasoning as
+        // the standalone-rekey leak test above).
+        alice.recover_via_fast_forward().await?;
+
+        // Remove the throwaway full member — this forces `handle_remove_member`
+        // to rekey the group, which must still exclude the scoped survivor.
+        alice.remove_user(throwaway_uid).await?;
+
+        // Inspect the scoped member's server-side delivery slot directly.
+        let server = transport.server_state();
+        let bytes = server
+            .lock()
+            .await
+            .get_delivery_slot(agent_uid)
+            .expect("scoped member has a delivery slot from its invite");
+
+        assert!(
+            serde_json::from_slice::<GkDeliveryEnvelope>(&bytes).is_err(),
+            "SECURITY LEAK: scoped member's slot contains a GroupKey envelope after a member-removal rekey"
+        );
+        assert!(
+            serde_json::from_slice::<ScopedDeliveryEnvelope>(&bytes).is_ok(),
+            "scoped member's slot should still hold its ScopedDeliveryEnvelope"
+        );
+        Ok(())
+    }
+
+    /// A rekey that lands between a scoped invite and the invitee's join must
+    /// not escalate them: they must still bootstrap as SCOPED (no group key).
+    /// This is Failure Mode 1 from the §8 design review — if the fix only
+    /// guarded the delivery-slot *contents* written at rekey time but the
+    /// invitee's slot had already been overwritten with a group-key envelope
+    /// (e.g. by a naive "rekey writes GK to every _users row" implementation),
+    /// this test would catch it: `join` would successfully parse a
+    /// `GkDeliveryEnvelope` and the agent would incorrectly hold the group key.
+    #[tokio::test]
+    async fn scoped_invite_rekeyed_before_join_still_bootstraps_scoped() -> Result<()> {
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        // Rekey BEFORE the scoped invitee joins.
+        alice.rekey().await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        assert!(
+            !agent.holds_group_key().await,
+            "scoped invitee rekeyed-before-join must not become a full member"
+        );
+        Ok(())
+    }
+
+    /// No-harm check: excluding scoped members from group-key rekey delivery
+    /// (the §8 fix) must not disturb normal delivery to FULL members. A full
+    /// member must still receive the group key across a rekey and decrypt
+    /// data written after it, alongside a scoped member that must not.
+    #[tokio::test]
+    async fn full_member_still_receives_group_key_across_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // A second FULL member.
+        let bob_invite = alice.invite_user().await?;
+        let bob = crate::Space::join(transport.clone(), bob_invite, schema()).await?;
+        bob.register_table_schema(msgs_schema()?);
+
+        // A scoped member (must NOT receive the group key across the rekey).
+        let agent_invite = alice.invite_user_scoped(&[1]).await?;
+        let _agent = crate::Space::join(transport.clone(), agent_invite, schema()).await?;
+
+        // Converge alice's `_users` cache on both members' post-join key
+        // rotations before rekeying (same reasoning as the leak test above).
+        alice.recover_via_fast_forward().await?;
+
+        alice.rekey().await?;
+
+        // Alice writes AFTER the rekey, under the new group-key epoch.
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg { id: None, channel_id: 1, body: "post-rekey secret".into() })
+            .execute()
+            .await?;
+
+        // Bob (full member) must still be able to decrypt it — proving normal
+        // rekey delivery to full members is intact.
+        bob.sync().await?;
+        let seen_by_bob: Vec<Msg> = bob.table::<Msg>("msgs").select().all().await?;
+        assert_eq!(
+            seen_by_bob.len(),
+            1,
+            "full member must still receive the group key across a rekey"
+        );
+        assert_eq!(seen_by_bob[0].body, "post-rekey secret");
+
+        Ok(())
+    }
 }
 
 fn query_param_to_value(param: &QueryParam) -> serde_json::Value {

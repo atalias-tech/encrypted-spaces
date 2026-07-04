@@ -568,6 +568,17 @@ impl Space {
     pub async fn sync(&self) -> Result<()> {
         self.recover_via_fast_forward().await
     }
+
+    /// Whether this member currently holds the group key (full read access),
+    /// as opposed to a scoped member, which holds only delivered channel
+    /// subtree keys and never the group key. Test-only: asserts the
+    /// *installed key state* directly — the real security property behind
+    /// L2 scoping (whitepaper §4.3) — rather than inspecting server-side
+    /// delivery-slot bytes.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn holds_group_key(&self) -> bool {
+        self.key_manager.lock().await.space_key().is_full()
+    }
 }
 
 impl Clone for Space {
