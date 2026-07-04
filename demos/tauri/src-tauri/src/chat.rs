@@ -353,6 +353,8 @@ pub async fn get_users(space: &Space) -> Result<Vec<UserInfo>> {
                 status: match u.status {
                     UserStatus::Provisional => "pending".to_string(),
                     UserStatus::Full => "member".to_string(),
+                    UserStatus::ScopedProvisional => "pending".to_string(),
+                    UserStatus::Scoped => "member".to_string(),
                 },
             }
         })

@@ -1,9 +1,9 @@
 use super::{
     append_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
-    derive_column_keys_with_row_id, extract_i64_from_kh_entries, extract_value_from_kh_entries,
-    partition_composite_entry, read_kh_ranges_indexed, read_next_id, table_from_column_keys,
-    validate_key_history_entries, validate_sorted_entries, validate_user_access, OpContext,
-    OpReader, OpVerifier, OpVerifyResult,
+    decode_i64_column_value, derive_column_keys_with_row_id, extract_i64_from_kh_entries,
+    extract_value_from_kh_entries, partition_composite_entry, read_kh_ranges_indexed, read_next_id,
+    read_user_status, validate_consistent_column_key_row_id, validate_key_history_entries,
+    validate_sorted_entries, validate_user_access, OpContext, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{ReadOp, TraceStep};
@@ -52,26 +52,32 @@ impl OpVerifier for RefreshKeysOp {
 
         validate_user_access(entry, OpType::RefreshKeys, "refresh_keys", reader)?;
 
-        // Read the authenticated _key_history next-id counter and derive
-        // the real _key_history column keys from the placeholder keys.
-        let kh_row_id = read_next_id(KEY_HISTORY_TABLE, "refresh_keys", reader)?;
-        let kh_column_keys =
-            derive_column_keys_with_row_id(&kh_entries, kh_row_id, "refresh_keys")?;
-
-        // Validate kh structure (column tuples, required columns, uid).
-        let kh_row_id_check =
-            validate_key_history_entries(&kh_column_keys, &kh_entries, entry.uid, "refresh_keys")?;
-        debug_assert_eq!(kh_row_id, kh_row_id_check);
-
         // _users column keys come straight from the (signed) entry.
         let users_column_keys: Vec<Vec<u8>> =
             users_entries.iter().map(|kv| kv.key.clone()).collect();
 
-        // Must target the _users table
-        let table = table_from_column_keys(&users_column_keys, "refresh_keys")?;
-        if table != "_users" {
+        // Bind the _users write to the signer's own single row. Every _users
+        // column key must share one (table, row_id): the table must be `_users`
+        // and the row_id must equal `entry.uid`. RefreshKeys only ever rotates
+        // the signer's own row — the SDK's `rotate_user_keys` writes a single
+        // `id == user_id` predicate row — so this is a no-op for legitimate
+        // flows. Without it, a signed entry could smuggle a DECOY `_users` row
+        // (row_id != uid) whose `status` the transition check would read by key
+        // order while the emitted write lands on the signer's own row: the C1
+        // status-escalation bypass. Enforced BEFORE the transition check below
+        // so that check can trust the sole `_users` row is the signer's.
+        let (users_table, users_row_id) =
+            validate_consistent_column_key_row_id(&users_column_keys, "refresh_keys", "_users")?;
+        if users_table != "_users" {
             return Err(ChangelogError::Generic(format!(
-                "refresh_keys: must target _users table, got '{table}'"
+                "refresh_keys: must target _users table, got '{users_table}'"
+            )));
+        }
+        if users_row_id != entry.uid as i64 {
+            return Err(ChangelogError::Generic(format!(
+                "refresh_keys: _users write must target only the signer's own \
+                 row (uid) — key targets row_id={users_row_id} but signer uid={}",
+                entry.uid
             )));
         }
 
@@ -86,6 +92,63 @@ impl OpVerifier for RefreshKeysOp {
                 )));
             }
         }
+
+        // L2 membership-lane immutability: when a RefreshKeys updates the
+        // `_users.status` marker it may only move Provisional(0)→Full(1) or
+        // ScopedProvisional(3)→Scoped(2), and may not change an already-joined
+        // member's lane (Full stays Full, Scoped stays Scoped). This forbids any
+        // scoped→Full escalation and is PROVEN, so an untrusted server cannot
+        // land a forged transition in an honest client's verified changelog.
+        // `matches!(old, 2 | 3)` here mirrors `UserStatus::is_scoped` in the SDK.
+        //
+        // Guard: only enforce when the entry actually updates `status`. A
+        // rotation that touches only update_key/auth_key leaves status unchanged,
+        // which is always valid — do not read/reject in that case.
+        if actual.contains("status") {
+            let old_status =
+                read_user_status(entry.uid, "refresh_keys", reader)?.ok_or_else(|| {
+                    ChangelogError::Generic(format!(
+                        "refresh_keys: could not read current status for uid={}",
+                        entry.uid
+                    ))
+                })?;
+            // Read `new_status` from the signer's OWN status column specifically,
+            // never "first status column by key order". The single-row==uid
+            // binding above already excludes decoy rows; reading the
+            // uid-specific key is defence in depth so the transition check can
+            // never be steered by a foreign row's value.
+            let status_key = column_key(USERS_TABLE, entry.uid as i64, "status");
+            let new_status_bytes = users_entries
+                .iter()
+                .find(|kv| kv.key == status_key)
+                .map(|kv| kv.value.as_slice())
+                .ok_or_else(|| {
+                    ChangelogError::Generic(format!(
+                        "refresh_keys: _users.status for uid={} not found in write",
+                        entry.uid
+                    ))
+                })?;
+            let new_status =
+                decode_i64_column_value(new_status_bytes, "refresh_keys", "_users.status")?;
+            let required = if matches!(old_status, 2 | 3) { 2 } else { 1 };
+            if new_status != required {
+                return Err(ChangelogError::Generic(format!(
+                    "refresh_keys: status transition violation \
+                     (old={old_status}, required={required}, got={new_status})"
+                )));
+            }
+        }
+
+        // Read the authenticated _key_history next-id counter and derive
+        // the real _key_history column keys from the placeholder keys.
+        let kh_row_id = read_next_id(KEY_HISTORY_TABLE, "refresh_keys", reader)?;
+        let kh_column_keys =
+            derive_column_keys_with_row_id(&kh_entries, kh_row_id, "refresh_keys")?;
+
+        // Validate kh structure (column tuples, required columns, uid).
+        let kh_row_id_check =
+            validate_key_history_entries(&kh_column_keys, &kh_entries, entry.uid, "refresh_keys")?;
+        debug_assert_eq!(kh_row_id, kh_row_id_check);
 
         // --- Semantic validation of _key_history values ---
 
@@ -269,6 +332,43 @@ mod tests {
                 entries,
             },
             sig_ref,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        }
+    }
+
+    /// Build a combined entry whose `_users` update carries both an opaque
+    /// `update_key` and a `status` column set to `new_status` (properly encoded
+    /// as an i64 so the transition check can decode it). Used by the
+    /// status-transition tests. First rotation (sig_ref=0).
+    fn make_combined_entry_with_status(
+        uid: u32,
+        kh_kvs: Vec<KvData>,
+        new_status: i64,
+    ) -> ChangelogEntry {
+        let mut user_kvs = vec![
+            KvData {
+                key: column_key("_users", uid as i64, "update_key"),
+                value: vec![0xAA; 32],
+            },
+            KvData {
+                key: column_key("_users", uid as i64, "status"),
+                value: stored_i64(new_status),
+            },
+        ];
+        user_kvs.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut entries = kh_kvs;
+        entries.extend(user_kvs);
+        ChangelogEntry {
+            timestamp: 1000,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::RefreshKeys,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
             parent_clc: [0u8; 32],
             signature: vec![],
         }
@@ -1023,6 +1123,352 @@ mod tests {
         assert!(
             msg.contains("expected the placeholder row_id=0"),
             "unexpected error: {msg}"
+        );
+    }
+
+    // ── Status-transition immutability (L2 membership lane) ──────────────
+    //
+    // A RefreshKeys that updates `_users.status` may only land the lawful
+    // join transition: Provisional(0)→Full(1) or ScopedProvisional(3)→
+    // Scoped(2), and may not move an already-joined member between lanes.
+    // This is the PROVEN barrier that stops an untrusted server from forging
+    // a scoped→Full escalation. Note the current status is read *twice*
+    // (validate_user_access + the transition check), so two status ProvenReads
+    // are supplied up front, matching the verifier's read order.
+
+    /// 0→1 (Provisional → Full) is the lawful full-member join; accepted.
+    #[test]
+    fn test_status_transition_provisional_to_full_accepted() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 1);
+
+        let sk = user_status_key(uid);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(0))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(0))],
+            },
+        ];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    /// 3→2 (ScopedProvisional → Scoped) is the lawful scoped-member join; accepted.
+    #[test]
+    fn test_status_transition_scoped_provisional_to_scoped_accepted() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 2);
+
+        let sk = user_status_key(uid);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(3))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(3))],
+            },
+        ];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    /// 2→1 (Scoped → Full) is a forbidden escalation; rejected.
+    #[test]
+    fn test_status_transition_scoped_to_full_rejected() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 1);
+
+        let sk = user_status_key(uid);
+        // Two status reads; the check rejects before any further reads.
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(2))],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("status transition violation")
+                && msg.contains("old=2")
+                && msg.contains("required=2")
+                && msg.contains("got=1"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// 3→1 (ScopedProvisional → Full) is a forbidden scoped→Full escalation; rejected.
+    #[test]
+    fn test_status_transition_scoped_provisional_to_full_rejected() {
+        let uid = 1u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry_with_status(uid, kh_kvs, 1);
+
+        let sk = user_status_key(uid);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(3))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(3))],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let err = RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("status transition violation")
+                && msg.contains("old=3")
+                && msg.contains("required=2")
+                && msg.contains("got=1"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// A RefreshKeys that rotates keys without updating `status` leaves the
+    /// membership lane unchanged — always valid, and the transition check is
+    /// skipped (no extra status ProvenRead is consumed).
+    #[test]
+    fn test_status_transition_absent_status_accepted() {
+        let uid = 1u32;
+        // Only update_key in the _users update; no status column.
+        let user_col = column_key("_users", uid as i64, "update_key");
+        let kh_kvs = make_kh_kvs(uid);
+        let entry = make_combined_entry(uid, kh_kvs, std::slice::from_ref(&user_col));
+
+        // A single status read (validate_user_access); the transition check is
+        // skipped because the entry does not touch `status`. Old status here is
+        // Scoped(2) — a scoped member rotating only its keys must be accepted.
+        let sk = user_status_key(uid);
+        let mut reads = vec![ProvenRead {
+            op: ReadOp::Key(sk.clone()),
+            results: vec![(sk, stored_i64(2))],
+        }];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    // ── C1: _users write must bind to the signer's own single row ────────
+    //
+    // These guard the status-escalation bypass: the transition rule is only
+    // sound if the emitted `_users` write and the `new_status` it is checked
+    // against both refer to the *signer's own* row.
+
+    /// C1 exploit (self-signed, no server collusion): a Scoped(2) attacker
+    /// uid=5 submits a RefreshKeys whose `_users` write carries a DECOY
+    /// lower-row-id `status = 2` column (row 1 sorts first by key order)
+    /// alongside the attacker's own `status = 1` (self → Full). Before the fix,
+    /// the transition check read the decoy `2` as `new_status`
+    /// (old(5)=2 → required=2 → passed) while the emitted write set the
+    /// attacker's own row to Full. The fix binds the `_users` write to the
+    /// signer's own single row, so this multi-row write is rejected outright.
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok`. GREEN after: `Err`.
+    #[test]
+    fn test_status_escalation_decoy_row_rejected() {
+        let uid = 5u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let mut user_kvs = vec![
+            // DECOY: row 1 sorts first by key order; its status=2 is what the
+            // old key-order-based reader picked up as `new_status`.
+            KvData {
+                key: column_key("_users", 1, "status"),
+                value: stored_i64(2),
+            },
+            // REAL escalation: the attacker's own row → Full(1).
+            KvData {
+                key: column_key("_users", uid as i64, "status"),
+                value: stored_i64(1),
+            },
+            KvData {
+                key: column_key("_users", uid as i64, "update_key"),
+                value: vec![0xAA; 32],
+            },
+        ];
+        user_kvs.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut entries = kh_kvs;
+        entries.extend(user_kvs);
+        let entry = ChangelogEntry {
+            timestamp: 1000,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::RefreshKeys,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        };
+
+        // Attacker is Scoped(2). Supply the full read sequence the vulnerable
+        // path consumes (two status reads + semantic reads) so that, pre-fix,
+        // E&V runs to completion and returns Ok — proving the bypass.
+        let sk = user_status_key(uid);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+        ];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(
+            result.is_err(),
+            "C1: multi-row _users write with a decoy status row must be \
+             rejected, got Ok (escalation succeeded)"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("single (table, row_id)")
+                || msg.contains("signer's own row")
+                || msg.contains("status transition"),
+            "expected a row-binding / transition rejection, got: {msg}"
+        );
+    }
+
+    /// C1 exploit variant with the decoy at a HIGHER row_id than the signer
+    /// (row 999 sorts *last* by key order, not first). This mirrors
+    /// `test_status_escalation_decoy_row_rejected` but flips which row is the
+    /// key-order "head": here the signer's own real row (5) sorts first and
+    /// the decoy (999) sorts last. The rejection must not depend on decoy
+    /// ordering — a future refactor that only re-checks a sorted head column
+    /// (assuming the decoy is always first) would wrongly accept this case.
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok`. GREEN after: `Err`.
+    #[test]
+    fn test_status_escalation_higher_rowid_decoy_rejected() {
+        let uid = 5u32;
+        let kh_kvs = make_kh_kvs(uid);
+        let mut user_kvs = vec![
+            // DECOY: row 999 sorts last by key order, unlike the low-row-id
+            // decoy above — proves rejection is independent of decoy position.
+            KvData {
+                key: column_key("_users", 999, "status"),
+                value: stored_i64(2),
+            },
+            // REAL escalation: the attacker's own row → Full(1).
+            KvData {
+                key: column_key("_users", uid as i64, "status"),
+                value: stored_i64(1),
+            },
+            KvData {
+                key: column_key("_users", uid as i64, "update_key"),
+                value: vec![0xAA; 32],
+            },
+        ];
+        user_kvs.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut entries = kh_kvs;
+        entries.extend(user_kvs);
+        let entry = ChangelogEntry {
+            timestamp: 1000,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::RefreshKeys,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        };
+
+        // Attacker is Scoped(2). Supply the full read sequence the vulnerable
+        // path consumes (two status reads + semantic reads) so that, pre-fix,
+        // E&V runs to completion and returns Ok — proving the bypass.
+        let sk = user_status_key(uid);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+        ];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(
+            result.is_err(),
+            "C1: multi-row _users write with a higher-row-id decoy status \
+             row must be rejected, got Ok (escalation succeeded)"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("single (table, row_id)")
+                || msg.contains("signer's own row")
+                || msg.contains("status transition"),
+            "expected a row-binding / transition rejection, got: {msg}"
+        );
+    }
+
+    /// A RefreshKeys whose `_users` write targets a DIFFERENT uid's row
+    /// (row_id != entry.uid) is rejected: RefreshKeys may only rotate the
+    /// signer's own row. RED before fix (the old table-only check accepts a
+    /// foreign row); GREEN after (the uid-binding check rejects it).
+    #[test]
+    fn test_refresh_keys_foreign_row_rejected() {
+        let uid = 5u32;
+        let kh_kvs = make_kh_kvs(uid);
+        // Key-only rotation, but targeting uid=999's `_users` row.
+        let foreign_col = column_key("_users", 999, "update_key");
+        let entry = make_combined_entry(uid, kh_kvs, std::slice::from_ref(&foreign_col));
+
+        let sk = user_status_key(uid);
+        let mut reads = vec![ProvenRead {
+            op: ReadOp::Key(sk.clone()),
+            results: vec![(sk, stored_i64(1))],
+        }];
+        reads.extend(make_semantic_reads(uid, &test_auth_key()));
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RefreshKeysOp::extract_and_validate(&entry, &mut reader, &OpContext::default());
+        assert!(
+            result.is_err(),
+            "a _users write targeting a foreign row must be rejected, got Ok"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("signer's own row") && msg.contains("row_id=999"),
+            "expected the signer's-own-row rejection, got: {msg}"
         );
     }
 }

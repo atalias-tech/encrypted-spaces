@@ -50,11 +50,12 @@ impl OpVerifier for InviteUserOp {
         }
 
         // --- Validate that the status of the new user row is set to provisional ---
+        // (0 = Provisional for a full invite, 3 = ScopedProvisional for a scoped invite).
         let inserted_status =
             extract_i64_column_from_entry(entry, crate::USERS_TABLE, "status", "invite_user")?;
         if !is_provisional_status(inserted_status) {
             return Err(ChangelogError::Generic(format!(
-                "invite_user: inserted _users.status must be provisional (0), got {inserted_status}"
+                "invite_user: inserted _users.status must be provisional (0 or 3), got {inserted_status}"
             )));
         }
 
@@ -148,7 +149,7 @@ mod tests {
     use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
     use encrypted_spaces_storage_encoding::{
         encode_column_names,
-        keys::{column_key, schema_columns_key},
+        keys::{column_key, schema_columns_key, schema_next_id_key},
     };
     use std::collections::BTreeSet;
 
@@ -328,5 +329,57 @@ mod tests {
             msg.contains("inserted _users.status must be provisional"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// Positive case: an invite that stamps `ScopedProvisional` (status=3) — the
+    /// L2 scoped-invite marker — is accepted. Full invites stamp 0, scoped
+    /// invites stamp 3; both are provisional. This locks in that 3 is allowed
+    /// (previously only covered indirectly via the SDK integration flow).
+    #[test]
+    fn test_invited_scoped_provisional_status_accepted() {
+        let uid = 1u32;
+        // Placeholder row_id=0 so the verifier can derive the assigned row_id.
+        let user_keys = vec![
+            column_key("_users", 0, "auth_key"),
+            column_key("_users", 0, "status"),
+            column_key("_users", 0, "update_key"),
+        ];
+        // Scoped invites carry no _retention rows; status = 3 (ScopedProvisional).
+        let entry = make_invite_entry_with_status(uid, &user_keys, &[], 3);
+
+        let user_cols: BTreeSet<String> = ["auth_key", "status", "update_key"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let sk = user_status_key(uid);
+        let reads = vec![
+            // Inviter is a full member (non-provisional) → allowed to invite.
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, value_to_bytes(&serde_json::json!(1)).unwrap())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_columns_key("_users")),
+                results: vec![(
+                    schema_columns_key("_users"),
+                    encode_column_names(&user_cols),
+                )],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_next_id_key("_users")),
+                results: vec![(
+                    schema_next_id_key("_users"),
+                    1i64.to_be_bytes().to_vec(),
+                )],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+
+        let result = InviteUserOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext::default(),
+        );
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
     }
 }

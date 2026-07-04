@@ -204,6 +204,13 @@ fn removed_user_ids_in_change(delete_change: &ChangelogEntry) -> BTreeSet<i64> {
         .collect()
 }
 
+/// A `_users.status` value denotes a scoped (L2) member: `Scoped = 2` or
+/// `ScopedProvisional = 3`. Scoped members remain members but must NEVER
+/// receive the group key, so they are excluded from rekey delivery.
+fn status_is_scoped(status: i64) -> bool {
+    status == 2 || status == 3
+}
+
 /// Pull the table name from the first parseable column key in `change`.
 /// Used to derive the target table for ops where the entry encodes it
 /// (Insert / Update / Delete / list ops).
@@ -1264,7 +1271,8 @@ impl SpaceState {
         Ok(())
     }
 
-    /// Check if the given user is provisional (status == 0).
+    /// Check if the given user is provisional (status 0 = `Provisional` or
+    /// 3 = `ScopedProvisional`; mirrors `UserStatus::is_provisional` in the SDK).
     pub fn is_provisional_user(&self, uid: i64) -> bool {
         let mut query = Query::new(
             USERS_TABLE_NAME.to_string(),
@@ -1276,11 +1284,13 @@ impl SpaceState {
             values: vec![QueryParam::Integer(uid)],
             cursor_id: None,
         });
-        self.db
-            .query_rows(&query)
-            .ok()
-            .and_then(|rows| rows.first()?.get("status")?.as_i64())
-            == Some(0)
+        matches!(
+            self.db
+                .query_rows(&query)
+                .ok()
+                .and_then(|rows| rows.first()?.get("status")?.as_i64()),
+            Some(0 | 3)
+        )
     }
 
     fn decode_auth_verifying_key(auth_key_b64: &str) -> Result<AuthVerifyingKey, ServerError> {
@@ -1422,7 +1432,7 @@ impl SpaceState {
         })
     }
 
-    /// Provisional users (status == 0) may only submit RefreshKeys changes.
+    /// Provisional users (status 0 or 3) may only submit RefreshKeys changes.
     /// All other op types are rejected until the user
     /// rotates keys and transitions to Full (status == 1).
     fn enforce_provisional_restrictions(&self, change: &ChangelogEntry) -> Result<(), ServerError> {
@@ -3252,14 +3262,15 @@ impl SpaceState {
             .select_table_rows_resolving_hashes(USERS_TABLE_NAME, &users_schema)
             .await?;
 
-        let uid_to_pk: HashMap<i64, <DefaultMkem as Mkem>::PublicKey> = rows
+        let uid_to_pk: HashMap<i64, (<DefaultMkem as Mkem>::PublicKey, i64)> = rows
             .iter()
             .filter_map(|row| {
                 let id = row.get("id")?.as_i64()?;
                 let b64 = row.get("update_key")?.as_str()?;
                 let json_bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
                 let pk = serde_json::from_slice(&json_bytes).ok()?;
-                Some((id, pk))
+                let status = row.get("status")?.as_i64()?;
+                Some((id, (pk, status)))
             })
             .collect();
 
@@ -3281,18 +3292,27 @@ impl SpaceState {
             )));
         }
 
-        let remaining_members: Vec<(i64, <DefaultMkem as Mkem>::PublicKey)> = remaining_uids
+        // Group-key recipients = survivors who are NOT scoped. Scoped members
+        // remain members (in remaining_uids, validated above) but must never
+        // receive the group key, so they are excluded from the rekey delivery.
+        // We iterate `remaining_uids` (the client-provided survivor order) and
+        // apply the same `!is_scoped` filter the SDK applied, so both sides
+        // produce the identical recipient ordering the MVE proof is bound to.
+        //
+        // `filter_map`'s silent drop of a `uid` missing from `uid_to_pk` is
+        // safe only because the survivor-integrity check just above already
+        // guarantees `requested_survivors == expected_survivors`, i.e. every
+        // `remaining_uid` here is a key in `uid_to_pk` — this is a defensive
+        // no-op, not a path that can silently narrow the recipient set.
+        let gk_recipients: Vec<(i64, <DefaultMkem as Mkem>::PublicKey)> = remaining_uids
             .iter()
-            .map(|&uid| {
-                uid_to_pk
-                    .get(&uid)
-                    .map(|pk| (uid, pk.clone()))
-                    .ok_or_else(|| ServerError::Generic(format!("uid {uid} not found in _users")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(|uid| uid_to_pk.get(uid).map(|(pk, st)| (*uid, pk.clone(), *st)))
+            .filter(|(_, _, st)| !status_is_scoped(*st))
+            .map(|(uid, pk, _)| (uid, pk))
+            .collect();
 
-        // 2. Verify the rekey MVE proof.
-        let pks: Vec<_> = remaining_members.iter().map(|(_, pk)| pk.clone()).collect();
+        // 2. Verify the rekey MVE proof over the non-scoped recipient set.
+        let pks: Vec<_> = gk_recipients.iter().map(|(_, pk)| pk.clone()).collect();
         let ciphertexts = verify_rekey(&pks, request)
             .map_err(|_| ServerError::Generic("rekey MVE verification failed".to_string()))?;
 
@@ -3324,10 +3344,12 @@ impl SpaceState {
             self.key_delivery_slots.remove(row_id);
         }
 
-        // 8. Refresh each remaining member's GK delivery slot with their
-        //    rekey envelope. Slot writes are best-effort; the canonical
-        //    retention mutation has already committed above.
-        for (i, (uid, _)) in remaining_members.iter().enumerate() {
+        // 8. Refresh each non-scoped recipient's GK delivery slot with their
+        //    rekey envelope. Scoped members are skipped, so their existing
+        //    (channel-key-only) slots are left untouched. Slot writes are
+        //    best-effort; the canonical retention mutation has already
+        //    committed above.
+        for (i, (uid, _)) in gk_recipients.iter().enumerate() {
             let ciphertext = ciphertexts.get(i).ok_or_else(|| {
                 ServerError::Generic(format!("missing ciphertext for member index {i}"))
             })?;
@@ -3383,10 +3405,19 @@ impl SpaceState {
                 .select_table_rows_resolving_hashes(USERS_TABLE_NAME, &users_schema)
                 .await?;
 
+            // Group-key recipients = all members MINUS scoped members. Scoped
+            // members (L2) must never receive the group key. We filter the
+            // `_users` rows in row order with the same `!is_scoped` rule the SDK
+            // (`Space::rekey`) applies to its `_users` cache, so both sides
+            // produce the identical recipient ordering the MVE proof is bound to.
             let members: Vec<(i64, <DefaultMkem as Mkem>::PublicKey)> = rows
                 .iter()
                 .filter_map(|row| {
                     let id = row.get("id")?.as_i64()?;
+                    let status = row.get("status")?.as_i64()?;
+                    if status_is_scoped(status) {
+                        return None;
+                    }
                     let b64 = row.get("update_key")?.as_str()?;
                     let json_bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
                     let pk = serde_json::from_slice(&json_bytes).ok()?;
@@ -4322,6 +4353,90 @@ mod tests {
         state
             .verify_change_signature(&change, &HashedValues::new())
             .unwrap();
+    }
+
+    /// §8 follow-up: a scoped invitee (`UserStatus::ScopedProvisional` = 3) is
+    /// provisional the same as a full invitee (status 0) — it must be
+    /// restricted to RefreshKeys until it rotates keys, exactly like
+    /// `provisional_user_cannot_insert` in sdk/src/lib.rs exercises end-to-end.
+    #[tokio::test]
+    async fn scoped_provisional_user_restricted_to_refresh_keys() {
+        let state = SpaceState::init_server(
+            None,
+            Some(SpaceInitConfig {
+                space_id: SpaceId::random(),
+                artifact_path: None,
+                verbose_logfile: None,
+                bootstrap_data: BootstrapDataSource::None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let auth = AuthContext::new(None, state.space_id);
+        let uid = state
+            .db
+            .insert(
+                Query::new(
+                    USERS_TABLE_NAME.to_string(),
+                    QueryOperation::Insert(vec![
+                        ("update_key".to_string(), QueryParam::Text(String::new())),
+                        ("auth_key".to_string(), QueryParam::Text(String::new())),
+                        // UserStatus::ScopedProvisional = 3 (see sdk/src/users.rs).
+                        ("status".to_string(), QueryParam::Integer(3)),
+                    ]),
+                ),
+                &auth,
+            )
+            .await
+            .unwrap();
+        let uid = u32::try_from(uid).expect("test uid fits in u32");
+
+        assert!(
+            state.is_provisional_user(uid as i64),
+            "status 3 (ScopedProvisional) must count as provisional"
+        );
+
+        // A non-RefreshKeys op (a plain Insert) must be rejected.
+        let label_key = column_key_placeholder("seed_rows", "label");
+        let label_value =
+            serde_json::to_vec(&serde_json::Value::String("seed".to_string())).unwrap();
+        let change = Change::new(
+            OpType::Insert,
+            uid,
+            ROOT_TREE_PATH,
+            &[label_key.as_slice()],
+            &[label_value.as_slice()],
+            0,
+            0,
+            [0u8; 32],
+        )
+        .unwrap();
+
+        let err = state
+            .enforce_provisional_restrictions(&change.entry)
+            .expect_err("scoped-provisional user must be RefreshKeys-restricted");
+        assert!(
+            err.to_string().contains("provisional_user_restricted"),
+            "unexpected error: {err}"
+        );
+
+        // RefreshKeys itself must still be allowed.
+        let refresh_change = Change::new(
+            OpType::RefreshKeys,
+            uid,
+            ROOT_TREE_PATH,
+            &[label_key.as_slice()],
+            &[label_value.as_slice()],
+            0,
+            0,
+            [0u8; 32],
+        )
+        .unwrap();
+        state
+            .enforce_provisional_restrictions(&refresh_change.entry)
+            .expect("RefreshKeys must remain allowed for a scoped-provisional user");
     }
 
     #[tokio::test]

@@ -121,6 +121,8 @@ impl<'de> Deserialize<'de> for UserWithSecrets<DefaultMkem, DefaultSignature> {
         let status = match helper.status {
             0 => Ok(UserStatus::Provisional),
             1 => Ok(UserStatus::Full),
+            2 => Ok(UserStatus::Scoped),
+            3 => Ok(UserStatus::ScopedProvisional),
             other => Err(serde::de::Error::custom(format!(
                 "unknown UserStatus value: {other}"
             ))),
@@ -137,14 +139,31 @@ impl<'de> Deserialize<'de> for UserWithSecrets<DefaultMkem, DefaultSignature> {
 
 /// Membership status for a user in the space.
 ///
-/// Stored as an integer column: `Pending = 0`, `Active = 1`.
+/// Stored as an integer column: Provisional=0, Full=1, Scoped=2, ScopedProvisional=3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
 pub enum UserStatus {
-    /// Invited but has not yet called [`Space::join`].
+    /// Full invite issued; invitee has not yet called [`Space::join`].
     Provisional = 0,
-    /// Has accepted the invite and rotated to permanent keypairs.
+    /// Joined and holds the group key (full read access).
     Full = 1,
+    /// Joined with L2 read scoping: holds only delivered channel subtree keys,
+    /// never the group key. Excluded from group-key rekey delivery.
+    Scoped = 2,
+    /// Scoped invite issued; invitee has not yet joined. Provisional-restricted
+    /// (RefreshKeys only) and excluded from group-key rekey delivery.
+    ScopedProvisional = 3,
+}
+
+impl UserStatus {
+    /// Members that must never receive the group key on rekey (L2 scoped).
+    pub fn is_scoped(self) -> bool {
+        matches!(self, UserStatus::Scoped | UserStatus::ScopedProvisional)
+    }
+    /// Has not yet completed key rotation → restricted to RefreshKeys.
+    pub fn is_provisional(self) -> bool {
+        matches!(self, UserStatus::Provisional | UserStatus::ScopedProvisional)
+    }
 }
 
 impl Serialize for UserStatus {
@@ -159,6 +178,8 @@ impl<'de> Deserialize<'de> for UserStatus {
         match value {
             0 => Ok(UserStatus::Provisional),
             1 => Ok(UserStatus::Full),
+            2 => Ok(UserStatus::Scoped),
+            3 => Ok(UserStatus::ScopedProvisional),
             other => Err(serde::de::Error::custom(format!(
                 "unknown UserStatus value: {other}"
             ))),
@@ -374,7 +395,7 @@ impl Space {
         //    writes — a scoped invite delivers no group key). _users is plaintext,
         //    so encrypt_query_fields is a no-op even without a group key.
         let mut pending_record = new_user.as_record();
-        pending_record.status = UserStatus::Provisional;
+        pending_record.status = UserStatus::ScopedProvisional;
         let mut insert_builder = self.users().insert(&pending_record);
         insert_builder.take_pending_error()?;
         crate::crypto::encrypt_query_fields(&mut insert_builder.query, self).await?;
@@ -439,16 +460,26 @@ impl Space {
         let remaining: Vec<&UserRecord> =
             all_users.iter().filter(|u| u.id != Some(user_id)).collect();
 
-        // 3. Collect remaining PKs and UIDs (same order)
-        let remaining_pks: Vec<SpacePublicKey> =
-            remaining.iter().map(|u| u.update_key.clone()).collect();
+        // 3. Two DISTINCT sets over the same `remaining` ordering:
+        //    - Survivor set (membership): ALL survivors. Passed to the server
+        //      as `remaining_uids` for the survivor-integrity check. Scoped
+        //      members remain members, so they stay here.
+        //    - Group-key recipient set: survivors MINUS scoped members. Scoped
+        //      members (L2) must never receive the group key, so they are
+        //      excluded from the rekey recipients. Row order is preserved so it
+        //      matches the server's identically-filtered order.
         let remaining_uids: Vec<i64> = remaining.iter().map(|u| u.id.unwrap_or(0)).collect();
+        let recipient_pks: Vec<SpacePublicKey> = remaining
+            .iter()
+            .filter(|u| !u.status.is_scoped())
+            .map(|u| u.update_key.clone())
+            .collect();
 
-        // 4. Generate the rekey request for remaining members
+        // 4. Generate the rekey request for the non-scoped recipients
         let mut rekey_builder = self.retention_builder();
         let delete_request = self
             .key_manager()
-            .rekey(&remaining_pks, &mut rekey_builder)
+            .rekey(&recipient_pks, &mut rekey_builder)
             .await?;
         let rekey_output = rekey_builder.finalize();
         let rekey_retention_writes = rekey_output.writes;
@@ -598,6 +629,20 @@ impl Space {
             (b64, kv, ml)
         };
 
+        // The status this rotation stamps depends on the member's read plane:
+        // a full member (holds the group key) becomes `Full`; a scoped member
+        // (L2 — holds only channel subtree keys, no group key) becomes `Scoped`,
+        // so it can never be mistaken for a full member. The guest op-verifier
+        // proves this transition is respected (see `refresh_keys_op.rs`).
+        let rotated_status = {
+            let km = self.key_manager.lock().await;
+            if km.space_key().is_full() {
+                UserStatus::Full
+            } else {
+                UserStatus::Scoped
+            }
+        };
+
         // Build _users update query
         let mut users_query = Query::new(
             USERS_TABLE_NAME.to_string(),
@@ -606,7 +651,7 @@ impl Space {
                 ("auth_key".to_string(), QueryParam::Text(auth_key_str)),
                 (
                     "status".to_string(),
-                    QueryParam::Integer(UserStatus::Full as i64),
+                    QueryParam::Integer(rotated_status as i64),
                 ),
             ]),
         );
@@ -894,6 +939,11 @@ mod tests {
     fn user_status_serializes_to_expected_integers() {
         assert_eq!(serde_json::to_value(UserStatus::Provisional).unwrap(), 0);
         assert_eq!(serde_json::to_value(UserStatus::Full).unwrap(), 1);
+        assert_eq!(serde_json::to_value(UserStatus::Scoped).unwrap(), 2);
+        assert_eq!(
+            serde_json::to_value(UserStatus::ScopedProvisional).unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -902,11 +952,15 @@ mod tests {
         assert_eq!(prov, UserStatus::Provisional);
         let full: UserStatus = serde_json::from_value(serde_json::json!(1)).unwrap();
         assert_eq!(full, UserStatus::Full);
+        let scoped: UserStatus = serde_json::from_value(serde_json::json!(2)).unwrap();
+        assert_eq!(scoped, UserStatus::Scoped);
+        let scoped_prov: UserStatus = serde_json::from_value(serde_json::json!(3)).unwrap();
+        assert_eq!(scoped_prov, UserStatus::ScopedProvisional);
     }
 
     #[test]
     fn user_status_rejects_unknown_integer() {
-        let err = serde_json::from_value::<UserStatus>(serde_json::json!(2)).unwrap_err();
+        let err = serde_json::from_value::<UserStatus>(serde_json::json!(4)).unwrap_err();
         assert!(
             err.to_string().contains("unknown UserStatus value"),
             "unexpected error: {err}"

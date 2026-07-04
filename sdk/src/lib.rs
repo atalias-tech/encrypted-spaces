@@ -568,6 +568,34 @@ impl Space {
     pub async fn sync(&self) -> Result<()> {
         self.recover_via_fast_forward().await
     }
+
+    /// Whether this member currently holds the group key (full read access),
+    /// as opposed to a scoped member, which holds only delivered channel
+    /// subtree keys and never the group key. Test-only: asserts the
+    /// *installed key state* directly — the real security property behind
+    /// L2 scoping (whitepaper §4.3) — rather than inspecting server-side
+    /// delivery-slot bytes.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn holds_group_key(&self) -> bool {
+        self.key_manager.lock().await.space_key().is_full()
+    }
+
+    /// Testing hook: fetch this member's server-side key-delivery slot over the
+    /// member's OWN authenticated transport connection.
+    ///
+    /// This is exactly the fetch a *malicious* scoped client would perform to
+    /// try to recover a group key from its delivery slot: an honest scoped
+    /// client ignores the slot entirely (`sync_group_key` returns
+    /// `AlreadyCurrent`), so `holds_group_key()` alone cannot detect a leaked
+    /// group-key envelope. Over the production `WebSocketTransport` this goes
+    /// through the real WS round-trip to the real server's `FetchMyKeyDelivery`
+    /// handler, letting a §8 leak-closure test assert on the raw slot bytes the
+    /// server actually deposited (a `ScopedDeliveryEnvelope`, never a
+    /// `GkDeliveryEnvelope`). Test-only; never compiled into production builds.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn fetch_my_key_delivery(&self) -> Result<Option<Vec<u8>>> {
+        self.transport.fetch_my_key_delivery().await
+    }
 }
 
 impl Clone for Space {
@@ -1903,6 +1931,8 @@ mod tests {
                     status: match user.status {
                         UserStatus::Provisional => "pending".to_string(),
                         UserStatus::Full => "member".to_string(),
+                        UserStatus::Scoped => "scoped".to_string(),
+                        UserStatus::ScopedProvisional => "scoped_provisional".to_string(),
                     },
                 }
             })
