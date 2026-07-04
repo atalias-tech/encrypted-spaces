@@ -2,9 +2,9 @@ use super::{
     append_insert_index_puts, append_multi_row_insert_index_puts, bump_next_id_after_chain,
     column_names_from_keys, derive_column_keys_for_chain, derive_column_keys_with_row_id,
     extract_i64_from_kh_entries, extract_value_from_kh_entries, partition_composite_entry,
-    read_kh_ranges_indexed, read_next_id, read_schema_columns, validate_consistent_column_key_row_id,
-    validate_key_history_entries, validate_scoped_grant_bindings, validate_user_access, OpReader,
-    OpVerifier, OpVerifyResult,
+    read_kh_ranges_indexed, read_next_id, read_schema_columns, require_full_member_signer,
+    validate_consistent_column_key_row_id, validate_key_history_entries,
+    validate_scoped_grant_bindings, validate_user_access, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, ReadOp, TraceStep};
@@ -67,8 +67,16 @@ impl OpVerifier for RemoveUserOp {
         }
         let deleted_uid = deleted_uid_i64 as u32;
 
-        // --- Validate the invoking user is a full member ---
-        validate_user_access(entry, OpType::RemoveUser, "remove_user", reader)?;
+        // --- The invoking user must be a FULL member (status 1) ---
+        // (Review follow-up: this comment previously claimed a full-member
+        // check that did not exist — validate_user_access only blocks
+        // provisional signers.) RemoveUser performs the member-removal rekey:
+        // it re-encrypts the group key, which scoped members never hold, so
+        // only a full member may sign it (§4.2, unconditional). This also
+        // closes the forged-grant path where a Scoped signer bundles a grant
+        // that its own scoped status would otherwise satisfy.
+        let signer_status = validate_user_access(entry, OpType::RemoveUser, "remove_user", reader)?;
+        require_full_member_signer(signer_status, entry.uid, "remove_user")?;
 
         // --- Validate user delete covers all schema columns per row ---
         let expected_user_cols = read_schema_columns(&user_table, "remove_user", reader, ctx)?;
@@ -226,8 +234,15 @@ impl OpVerifier for RemoveUserOp {
             // Member removal is the second authorized grant path: the server
             // rekeys the group and (Task 5) re-bundles refreshed grants for the
             // REMAINING scoped members. Each grant row must bind to an existing
-            // Scoped/ScopedProvisional _users row (read per grant's own uid).
-            validate_scoped_grant_bindings(&retention_entries, "remove_user", reader)?;
+            // Scoped/ScopedProvisional _users row (read per grant's own uid) —
+            // and never to the uid being removed (access dies with removal;
+            // the pre-op status read would still show it as Scoped).
+            validate_scoped_grant_bindings(
+                &retention_entries,
+                "remove_user",
+                reader,
+                Some(deleted_uid as i64),
+            )?;
 
             let expected_retention_cols =
                 read_schema_columns(crate::RETENTION_TABLE, "remove_user", reader, ctx)?;
@@ -693,6 +708,111 @@ mod tests {
         assert!(
             msg.contains("must bind to an existing") && msg.contains("uid=8"),
             "expected a scoped-binding rejection, got: {msg}"
+        );
+    }
+
+    /// CRITICAL (review follow-up): a Scoped(2) member must not be able to
+    /// sign a RemoveUser — the member-removal rekey re-encrypts the group key,
+    /// which scoped members never hold. Pre-fix, the "full member" check
+    /// documented in the verifier was not actually enforced (only provisional
+    /// signers were blocked), so a scoped signer + colluding server could push
+    /// a forged grant through this authorized path.
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok`. GREEN after: `Err`
+    /// naming the full-member signer requirement.
+    #[test]
+    fn test_scoped_signer_remove_user_with_grant_rejected() {
+        let remover_uid = 2u32;
+        let deleted_uid = 5u32;
+        let grant_uid = 8i64;
+        let entry = make_remove_entry_with_grant(
+            remover_uid,
+            deleted_uid,
+            &format!("sl2/channel_grant/{grant_uid}/7"),
+        );
+
+        let mut reads = verifier_reads(remover_uid, deleted_uid, &test_auth_key(), vec![]);
+        // Signer is Scoped(2), not Full — pre-fix this passes the provisional
+        // gate and the op runs to completion.
+        reads[0].results = vec![(user_status_key(remover_uid), stored_i64(2))];
+        let guk = user_status_key(grant_uid as u32);
+        reads.insert(
+            6,
+            ProvenRead {
+                op: ReadOp::Key(guk.clone()),
+                results: vec![(guk, stored_i64(2))], // grant target is Scoped
+            },
+        );
+        let mut reader = VerifierReader::new(&reads);
+
+        let result = RemoveUserOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext {
+                current_change_id: 1,
+                action_name: None,
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a Scoped signer's RemoveUser (with a bundled grant) must be \
+             rejected, got Ok"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("full member"),
+            "expected the full-member signer rejection, got: {msg}"
+        );
+    }
+
+    /// MINOR (review follow-up): a RemoveUser must not bundle a grant for the
+    /// very uid being removed — access dies with removal. Pre-fix, the
+    /// pre-op status read still saw the removed member as Scoped(2), so
+    /// `channel_grant/{removed_uid}/…` passed the scoped-uid binding.
+    ///
+    /// RED before fix: `Ok`. GREEN after: `Err` naming the removed uid.
+    #[test]
+    fn test_channel_grant_for_removed_uid_rejected() {
+        let remover_uid = 1u32;
+        let deleted_uid = 5u32;
+        let entry = make_remove_entry_with_grant(
+            remover_uid,
+            deleted_uid,
+            &format!("sl2/channel_grant/{deleted_uid}/7"),
+        );
+
+        let mut reads = verifier_reads(remover_uid, deleted_uid, &test_auth_key(), vec![]);
+        // Pre-fix the vulnerable path reads the removed uid's (still-present,
+        // pre-op) status: Scoped(2) — which passed the binding. Post-fix the
+        // rejection fires BEFORE this read; it stays unconsumed.
+        let guk = user_status_key(deleted_uid);
+        reads.insert(
+            6,
+            ProvenRead {
+                op: ReadOp::Key(guk.clone()),
+                results: vec![(guk, stored_i64(2))],
+            },
+        );
+        let mut reader = VerifierReader::new(&reads);
+
+        let result = RemoveUserOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext {
+                current_change_id: 1,
+                action_name: None,
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a grant bundled for the uid being removed must be rejected, got Ok"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("removed") && msg.contains("uid=5"),
+            "expected a removed-uid grant rejection, got: {msg}"
         );
     }
 

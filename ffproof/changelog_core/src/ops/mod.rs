@@ -132,6 +132,18 @@ pub(crate) fn is_channel_grant_key(key_value: &[u8]) -> bool {
     retention_key_string(key_value).is_some_and(|s| s.starts_with(GRANT_KEY_PREFIX))
 }
 
+/// True if `kv` is a `_retention` "key"-column entry whose stored value is
+/// grant-prefixed. Prefix test only — non-canonical spellings are detected too
+/// (they trigger the same gates, then fail the canonical parse where bound).
+pub(crate) fn is_grant_key_column_entry(kv: &KvData) -> bool {
+    let is_key_col = matches!(
+        parse_key(&kv.key),
+        Ok(ParsedKey::Column { table, column, .. })
+            if table == RETENTION_TABLE && column == "key"
+    );
+    is_key_col && is_channel_grant_key(&kv.value)
+}
+
 /// Parse a channel-grant logical key string into `(uid, channel)`, requiring
 /// STRICT CANONICAL FORM: `sl2/channel_grant/{uid}/{channel}` where `uid` and
 /// `channel` are non-negative decimal integers with no sign, no leading zeros,
@@ -206,12 +218,7 @@ pub(crate) fn reject_channel_grant_entries(
     op_name: &str,
 ) -> Result<(), ChangelogError> {
     for kv in retention_entries {
-        let is_key_col = matches!(
-            parse_key(&kv.key),
-            Ok(ParsedKey::Column { table, column, .. })
-                if table == RETENTION_TABLE && column == "key"
-        );
-        if is_key_col && is_channel_grant_key(&kv.value) {
+        if is_grant_key_column_entry(kv) {
             return Err(ChangelogError::Generic(format!(
                 "{op_name}: channel_grant _retention rows are not allowed in {op_name} — \
                  grants may only be written by invite/rekey"
@@ -232,15 +239,27 @@ pub(crate) fn reject_channel_grant_entries(
 /// never "the first status column by key order". Every grant-prefixed entry is
 /// validated individually, so one legitimate grant cannot smuggle others
 /// through. Non-canonical grant keys are rejected before any read.
+///
+/// `removed_uid`: for the member-removal path (`RemoveUser`), the uid being
+/// removed. A grant targeting it is rejected BEFORE any status read — the
+/// pre-op state still shows the removed member as Scoped, but access must die
+/// with removal. `Rekey` passes `None`.
 pub(crate) fn validate_scoped_grant_bindings(
     retention_entries: &[KvData],
     op_name: &str,
     reader: &mut dyn OpReader,
+    removed_uid: Option<i64>,
 ) -> Result<(), ChangelogError> {
     for kv in retention_entries {
         let Some(grant_uid) = grant_key_uid_of_entry(kv, op_name)? else {
             continue; // not a grant "key" entry
         };
+        if removed_uid == Some(grant_uid) {
+            return Err(ChangelogError::Generic(format!(
+                "{op_name}: channel_grant row for uid={grant_uid} targets the user \
+                 being removed — grants must not be issued to a removed member"
+            )));
+        }
         let uid_u32 = u32::try_from(grant_uid).map_err(|_| {
             ChangelogError::Generic(format!(
                 "{op_name}: channel_grant uid={grant_uid} is out of range for a _users row id"
@@ -616,15 +635,18 @@ pub(crate) fn extract_i64_column_from_entry(
 /// Read the user's status column via `reader`, verify the user exists, and
 /// enforce provisional user restrictions: provisional users (status 0 or 3)
 /// may only perform `RefreshKeys`.
+///
+/// Returns the signer's status as read (a single proven read), so callers
+/// with stronger signer requirements (e.g. `require_full_member_signer`) can
+/// check it without consuming a second read.
 pub(crate) fn validate_user_access(
     entry: &ChangelogEntry,
     op_type: OpType,
     op_name: &str,
     reader: &mut dyn OpReader,
-) -> Result<(), ChangelogError> {
-    let is_provisional = read_user_status(entry.uid, op_name, reader)?
-        .map(is_provisional_status)
-        .unwrap_or(false);
+) -> Result<Option<i64>, ChangelogError> {
+    let status = read_user_status(entry.uid, op_name, reader)?;
+    let is_provisional = status.map(is_provisional_status).unwrap_or(false);
 
     if is_provisional && op_type != OpType::RefreshKeys {
         return Err(ChangelogError::Generic(format!(
@@ -633,6 +655,31 @@ pub(crate) fn validate_user_access(
         )));
     }
 
+    Ok(status)
+}
+
+/// Require the op's signer to be a FULL member (status 1). Fail-closed:
+/// `None` (missing/undecodable status) is rejected.
+///
+/// Spec §4.2: grant-carrying ops must be signed by a full member. `Rekey` and
+/// `RemoveUser` enforce this UNCONDITIONALLY — both rotate the group key,
+/// which scoped members never hold (the SDK excludes scoped members from
+/// group-key delivery), so a Scoped(2) signer is always illegitimate there.
+/// `InviteUser` enforces it whenever the invite carries grant rows. Without
+/// this, a Scoped member colluding with the server could push a forged
+/// `sl2/channel_grant/{self}/{channel}` through an authorized grant path: its
+/// own status is Scoped, so the per-uid grant binding alone would pass.
+pub(crate) fn require_full_member_signer(
+    signer_status: Option<i64>,
+    signer_uid: u32,
+    op_name: &str,
+) -> Result<(), ChangelogError> {
+    if signer_status != Some(1) {
+        return Err(ChangelogError::Generic(format!(
+            "{op_name}: signer uid={signer_uid} must be a full member (status 1) \
+             to perform {op_name}, got status {signer_status:?}"
+        )));
+    }
     Ok(())
 }
 

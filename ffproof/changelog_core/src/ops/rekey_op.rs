@@ -1,7 +1,8 @@
 use super::{
     append_multi_row_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
-    derive_column_keys_for_chain, read_next_id, read_schema_columns, table_from_column_keys,
-    validate_scoped_grant_bindings, validate_user_access, OpReader, OpVerifier, OpVerifyResult,
+    derive_column_keys_for_chain, read_next_id, read_schema_columns, require_full_member_signer,
+    table_from_column_keys, validate_scoped_grant_bindings, validate_user_access, OpReader,
+    OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, TraceStep};
@@ -35,13 +36,20 @@ impl OpVerifier for RekeyOp {
             )));
         }
 
-        validate_user_access(entry, OpType::Rekey, "rekey", reader)?;
+        let signer_status = validate_user_access(entry, OpType::Rekey, "rekey", reader)?;
+
+        // §4.2: a rekey rotates the group key, which scoped members never hold
+        // (the SDK excludes them from group-key delivery) — the signer must be
+        // a FULL member, unconditionally. This also closes the forged
+        // self-grant path: without it, a Scoped signer's own status (2) would
+        // satisfy the scoped-uid grant binding below.
+        require_full_member_signer(signer_status, entry.uid, "rekey")?;
 
         // Standalone retention rekey is one of the two authorized grant paths:
         // it may (re)issue channel grants, but each grant row must bind to an
         // existing Scoped/ScopedProvisional _users row (read per grant's own
         // uid — decoy-proof). Non-grant retention rows pass untouched.
-        validate_scoped_grant_bindings(&entry.message.entries, "rekey", reader)?;
+        validate_scoped_grant_bindings(&entry.message.entries, "rekey", reader, None)?;
 
         let expected_retention_cols =
             read_schema_columns(crate::RETENTION_TABLE, "rekey", reader, ctx)?;
@@ -337,6 +345,52 @@ mod tests {
         assert!(
             msg.contains("must bind to an existing") && msg.contains("uid=6"),
             "expected rejection naming the smuggled uid, got: {msg}"
+        );
+    }
+
+    /// CRITICAL (review follow-up): a Scoped(2) member must not be able to
+    /// sign a Rekey at all — only full members hold the group key a rekey
+    /// rotates. Pre-fix, a scoped signer S colluding with the server could
+    /// submit a Rekey carrying `sl2/channel_grant/{S}/{C}` for a channel S was
+    /// never granted: the scoped-uid binding read S's OWN status (2, Scoped)
+    /// and passed, committing a forged grant via the authorized path and
+    /// bypassing the Extend/Reduce rejections.
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok`. GREEN after: `Err`
+    /// naming the full-member signer requirement.
+    #[test]
+    fn test_scoped_signer_rekey_self_grant_rejected() {
+        let signer = 5u32;
+        // Self-grant: uid == signer, arbitrary channel the signer never held.
+        let entry = make_rekey_entry_kv(signer, grant_row_kvs(signer as i64, 9));
+
+        // Full pre-fix read stream so the vulnerable path runs to completion:
+        // signer status (2 — passes the provisional gate), grant-uid status
+        // (same row, 2 — scoped binding passes), then the retention tail.
+        let sk = user_status_key(signer);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk.clone(), stored_i64(2))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(2))],
+            },
+        ];
+        reads.extend(rekey_retention_tail_reads());
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RekeyOp::extract_and_validate(&entry, &mut reader, &super::super::OpContext::default());
+        assert!(
+            result.is_err(),
+            "a Scoped signer's Rekey (self-grant forgery) must be rejected, \
+             got Ok (forged grant committed)"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("full member"),
+            "expected the full-member signer rejection, got: {msg}"
         );
     }
 

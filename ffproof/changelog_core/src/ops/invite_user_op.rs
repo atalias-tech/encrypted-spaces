@@ -1,9 +1,9 @@
 use super::{
     append_multi_row_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
     derive_column_keys_for_chain, derive_column_keys_with_row_id, extract_i64_column_from_entry,
-    is_provisional_status, next_id_after, next_id_put, partition_composite_entry, read_next_id,
-    read_schema_columns, validate_invite_grant_bindings, validate_user_access, OpReader, OpVerifier,
-    OpVerifyResult,
+    is_grant_key_column_entry, is_provisional_status, next_id_after, next_id_put,
+    partition_composite_entry, read_next_id, read_schema_columns, require_full_member_signer,
+    validate_invite_grant_bindings, validate_user_access, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, TraceStep};
@@ -37,7 +37,17 @@ impl OpVerifier for InviteUserOp {
             ));
         }
 
-        validate_user_access(entry, OpType::InviteUser, "invite_user", reader)?;
+        let signer_status = validate_user_access(entry, OpType::InviteUser, "invite_user", reader)?;
+
+        // §4.2: channel-grant rows may only be issued by a FULL member. The
+        // detector is prefix-based so a non-canonical spelling cannot dodge
+        // this gate (it is additionally rejected as non-canonical below).
+        // Blocks the sockpuppet path: a Scoped signer inviting a puppet and
+        // handing it grant rows.
+        let has_grant_rows = retention_entries.iter().any(is_grant_key_column_entry);
+        if has_grant_rows {
+            require_full_member_signer(signer_status, entry.uid, "invite_user")?;
+        }
 
         let expected_user_cols =
             read_schema_columns(crate::USERS_TABLE, "invite_user", reader, ctx)?;
@@ -57,6 +67,17 @@ impl OpVerifier for InviteUserOp {
         if !is_provisional_status(inserted_status) {
             return Err(ChangelogError::Generic(format!(
                 "invite_user: inserted _users.status must be provisional (0 or 3), got {inserted_status}"
+            )));
+        }
+
+        // Grant rows are only meaningful on a SCOPED invite (status 3): they
+        // hand the invitee its channel subtree keys in lieu of the group key.
+        // A FULL invite (status 0) receives the group key — grant rows there
+        // are a smuggling vector and are rejected.
+        if has_grant_rows && inserted_status != 3 {
+            return Err(ChangelogError::Generic(format!(
+                "invite_user: channel_grant rows are only allowed on a scoped invite \
+                 (inserted _users.status 3), got status {inserted_status}"
             )));
         }
 
@@ -346,6 +367,97 @@ mod tests {
         assert!(
             msg.contains("non-canonical channel_grant key"),
             "expected a non-canonical rejection, got: {msg}"
+        );
+    }
+
+    /// CRITICAL (review follow-up): a Scoped(2) member must not be able to
+    /// issue channel grants via InviteUser (sockpuppet invite: a scoped
+    /// signer invites a puppet and hands it grant rows). Grant-carrying
+    /// invites require a FULL member signer.
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok`. GREEN after: `Err`
+    /// naming the full-member signer requirement.
+    #[test]
+    fn test_scoped_signer_invite_with_grant_rejected() {
+        let inviter = 7u32;
+        let invitee_uid = 1i64;
+        // Same shape as the accepted case (scoped invite, grant bound to the
+        // invitee) — only the signer's status differs.
+        let entry = make_invite_entry_kv(
+            inviter,
+            vec![
+                (column_key("_users", 0, "auth_key"), vec![0xAA; 32]),
+                (column_key("_users", 0, "status"), stored_i64(3)),
+                (column_key("_users", 0, "update_key"), vec![0xAA; 32]),
+                (
+                    column_key("_retention", 0, "key"),
+                    stored_str(&format!("sl2/channel_grant/{invitee_uid}/5")),
+                ),
+                (column_key("_retention", 0, "value"), vec![0xBB; 32]),
+            ],
+        );
+        let mut reads = invite_grant_reads(inviter, invitee_uid);
+        // Signer is Scoped(2), not Full — pre-fix this passes the provisional
+        // gate and the invite runs to completion.
+        reads[0].results = vec![(user_status_key(inviter), stored_i64(2))];
+        let mut reader = VerifierReader::new(&reads);
+        let result = InviteUserOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext::default(),
+        );
+        assert!(
+            result.is_err(),
+            "a Scoped signer's grant-carrying invite must be rejected, got Ok"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("full member"),
+            "expected the full-member signer rejection, got: {msg}"
+        );
+    }
+
+    /// IMPORTANT (review follow-up): grant rows are only meaningful on a
+    /// SCOPED invite (inserted status 3) — they hand the invitee its channel
+    /// subtree keys in lieu of the group key. A FULL invite (inserted status
+    /// 0) receives the group key; grant rows there are a smuggling vector and
+    /// must be rejected even when bound to the invitee's uid.
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok`. GREEN after: `Err`
+    /// naming the scoped-invite requirement.
+    #[test]
+    fn test_full_invite_with_grant_rejected() {
+        let inviter = 7u32;
+        let invitee_uid = 1i64;
+        let entry = make_invite_entry_kv(
+            inviter,
+            vec![
+                (column_key("_users", 0, "auth_key"), vec![0xAA; 32]),
+                // FULL invite: inserted status = Provisional(0), not 3.
+                (column_key("_users", 0, "status"), stored_i64(0)),
+                (column_key("_users", 0, "update_key"), vec![0xAA; 32]),
+                (
+                    column_key("_retention", 0, "key"),
+                    stored_str(&format!("sl2/channel_grant/{invitee_uid}/5")),
+                ),
+                (column_key("_retention", 0, "value"), vec![0xBB; 32]),
+            ],
+        );
+        let reads = invite_grant_reads(inviter, invitee_uid);
+        let mut reader = VerifierReader::new(&reads);
+        let result = InviteUserOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext::default(),
+        );
+        assert!(
+            result.is_err(),
+            "grant rows on a full (non-scoped) invite must be rejected, got Ok"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("scoped invite"),
+            "expected the scoped-invite-only rejection, got: {msg}"
         );
     }
 
