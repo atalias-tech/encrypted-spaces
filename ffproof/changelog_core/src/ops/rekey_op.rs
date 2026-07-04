@@ -1,7 +1,7 @@
 use super::{
     append_multi_row_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
     derive_column_keys_for_chain, read_next_id, read_schema_columns, table_from_column_keys,
-    validate_user_access, OpReader, OpVerifier, OpVerifyResult,
+    validate_scoped_grant_bindings, validate_user_access, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, TraceStep};
@@ -36,6 +36,12 @@ impl OpVerifier for RekeyOp {
         }
 
         validate_user_access(entry, OpType::Rekey, "rekey", reader)?;
+
+        // Standalone retention rekey is one of the two authorized grant paths:
+        // it may (re)issue channel grants, but each grant row must bind to an
+        // existing Scoped/ScopedProvisional _users row (read per grant's own
+        // uid — decoy-proof). Non-grant retention rows pass untouched.
+        validate_scoped_grant_bindings(&entry.message.entries, "rekey", reader)?;
 
         let expected_retention_cols =
             read_schema_columns(crate::RETENTION_TABLE, "rekey", reader, ctx)?;
@@ -117,12 +123,255 @@ mod tests {
     use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
     use encrypted_spaces_storage_encoding::{
         encode_column_names,
-        keys::{column_key, schema_columns_key},
+        keys::{column_key, schema_columns_key, schema_indexes_key, schema_next_id_key},
     };
     use std::collections::BTreeSet;
 
     fn user_status_key(uid: u32) -> Vec<u8> {
         column_key("_users", uid as i64, "status")
+    }
+
+    fn stored_i64(v: i64) -> Vec<u8> {
+        value_to_bytes(&serde_json::json!(v)).unwrap()
+    }
+
+    fn stored_str(s: &str) -> Vec<u8> {
+        value_to_bytes(&serde_json::json!(s)).unwrap()
+    }
+
+    fn make_rekey_entry_kv(uid: u32, kvs: Vec<(Vec<u8>, Vec<u8>)>) -> ChangelogEntry {
+        let entries: Vec<KvData> = kvs
+            .into_iter()
+            .map(|(key, value)| KvData { key, value })
+            .collect();
+        ChangelogEntry {
+            timestamp: 1000,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::Rekey,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        }
+    }
+
+    /// One `_retention` grant row keyed to `grant_uid`/`channel`.
+    fn grant_row_kvs(grant_uid: i64, channel: i64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            (
+                column_key("_retention", 0, "key"),
+                stored_str(&format!("sl2/channel_grant/{grant_uid}/{channel}")),
+            ),
+            (column_key("_retention", 0, "value"), vec![0xBB; 32]),
+        ]
+    }
+
+    /// Tail reads for a rekey that reaches the retention-write phase (i.e. all
+    /// grant bindings passed): schema _retention → next_id → schema_indexes.
+    fn rekey_retention_tail_reads() -> Vec<ProvenRead> {
+        let retention_cols: BTreeSet<String> =
+            ["key", "value"].into_iter().map(str::to_string).collect();
+        vec![
+            ProvenRead {
+                op: ReadOp::Key(schema_columns_key("_retention")),
+                results: vec![(
+                    schema_columns_key("_retention"),
+                    encode_column_names(&retention_cols),
+                )],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_next_id_key("_retention")),
+                results: vec![(
+                    schema_next_id_key("_retention"),
+                    1i64.to_be_bytes().to_vec(),
+                )],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_indexes_key("_retention")),
+                results: vec![(schema_indexes_key("_retention"), b"key".to_vec())],
+            },
+        ]
+    }
+
+    /// A standalone rekey may (re)issue a grant to a Scoped(2) member; accepted.
+    #[test]
+    fn test_channel_grant_scoped_uid_accepted_for_rekey() {
+        let signer = 1u32;
+        let grant_uid = 5i64;
+        let entry = make_rekey_entry_kv(signer, grant_row_kvs(grant_uid, 7));
+
+        let sk = user_status_key(signer);
+        let guk = user_status_key(grant_uid as u32);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(guk.clone()),
+                results: vec![(guk, stored_i64(2))], // Scoped
+            },
+        ];
+        reads.extend(rekey_retention_tail_reads());
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RekeyOp::extract_and_validate(&entry, &mut reader, &super::super::OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    /// A grant to a ScopedProvisional(3) member is also accepted.
+    #[test]
+    fn test_channel_grant_scoped_provisional_uid_accepted_for_rekey() {
+        let signer = 1u32;
+        let grant_uid = 5i64;
+        let entry = make_rekey_entry_kv(signer, grant_row_kvs(grant_uid, 7));
+
+        let sk = user_status_key(signer);
+        let guk = user_status_key(grant_uid as u32);
+        let mut reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(guk.clone()),
+                results: vec![(guk, stored_i64(3))], // ScopedProvisional
+            },
+        ];
+        reads.extend(rekey_retention_tail_reads());
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RekeyOp::extract_and_validate(&entry, &mut reader, &super::super::OpContext::default());
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
+    }
+
+    /// A rekey grant bound to a Full(1) member is rejected — a full member
+    /// holds the group key and must never be handed a scoped channel grant
+    /// (and, inversely, a full member cannot forge itself one via rekey).
+    #[test]
+    fn test_channel_grant_full_uid_rejected_for_rekey() {
+        let signer = 1u32;
+        let grant_uid = 5i64;
+        let entry = make_rekey_entry_kv(signer, grant_row_kvs(grant_uid, 7));
+
+        let sk = user_status_key(signer);
+        let guk = user_status_key(grant_uid as u32);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(guk.clone()),
+                results: vec![(guk, stored_i64(1))], // Full
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RekeyOp::extract_and_validate(&entry, &mut reader, &super::super::OpContext::default());
+        assert!(result.is_err(), "grant to a Full member must be rejected");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("must bind to an existing") && msg.contains("uid=5"),
+            "expected a scoped-binding rejection, got: {msg}"
+        );
+    }
+
+    /// A multi-row rekey where a legitimate scoped grant is followed by a
+    /// forged grant for a Full member must be rejected — every grant row is
+    /// checked against its own uid's status, so one legit row can't smuggle
+    /// another through.
+    #[test]
+    fn test_channel_grant_decoy_multi_row_rejected_for_rekey() {
+        let signer = 1u32;
+        let scoped_uid = 5i64;
+        let full_uid = 6i64;
+        // Two chained grant rows: row0 → scoped uid 5 (legit), row1 → full uid 6.
+        let key_col = column_key("_retention", 0, "key");
+        let value_col = column_key("_retention", 0, "value");
+        let entry = make_rekey_entry_kv(
+            signer,
+            vec![
+                (
+                    key_col.clone(),
+                    stored_str(&format!("sl2/channel_grant/{scoped_uid}/7")),
+                ),
+                (value_col.clone(), vec![0xBB; 32]),
+                (
+                    key_col,
+                    stored_str(&format!("sl2/channel_grant/{full_uid}/7")),
+                ),
+                (value_col, vec![0xCC; 32]),
+            ],
+        );
+
+        let sk = user_status_key(signer);
+        let s5 = user_status_key(scoped_uid as u32);
+        let s6 = user_status_key(full_uid as u32);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, stored_i64(1))],
+            },
+            ProvenRead {
+                op: ReadOp::Key(s5.clone()),
+                results: vec![(s5, stored_i64(2))], // scoped → passes
+            },
+            ProvenRead {
+                op: ReadOp::Key(s6.clone()),
+                results: vec![(s6, stored_i64(1))], // full → rejects
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RekeyOp::extract_and_validate(&entry, &mut reader, &super::super::OpContext::default());
+        assert!(
+            result.is_err(),
+            "a forged grant smuggled behind a legit scoped grant must be rejected"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("must bind to an existing") && msg.contains("uid=6"),
+            "expected rejection naming the smuggled uid, got: {msg}"
+        );
+    }
+
+    /// A non-canonical (negative-uid) grant key is rejected before any status
+    /// read — canonical decimal form is mandatory.
+    #[test]
+    fn test_channel_grant_noncanonical_rejected_for_rekey() {
+        let signer = 1u32;
+        let entry = make_rekey_entry_kv(
+            signer,
+            vec![
+                (
+                    column_key("_retention", 0, "key"),
+                    stored_str("sl2/channel_grant/-5/7"),
+                ),
+                (column_key("_retention", 0, "value"), vec![0xBB; 32]),
+            ],
+        );
+        let sk = user_status_key(signer);
+        let reads = vec![ProvenRead {
+            op: ReadOp::Key(sk.clone()),
+            results: vec![(sk, stored_i64(1))],
+        }];
+        let mut reader = VerifierReader::new(&reads);
+        let result =
+            RekeyOp::extract_and_validate(&entry, &mut reader, &super::super::OpContext::default());
+        assert!(
+            result.is_err(),
+            "a non-canonical (negative-uid) grant key must be rejected"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("non-canonical channel_grant key"),
+            "expected a non-canonical rejection, got: {msg}"
+        );
     }
 
     fn make_rekey_entry(uid: u32, retention_keys: &[Vec<u8>]) -> ChangelogEntry {

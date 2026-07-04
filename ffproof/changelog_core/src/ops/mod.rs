@@ -93,6 +93,198 @@ pub(crate) fn validate_not_internal_table(
     Ok(())
 }
 
+// ─── Channel-grant row authority binding (L2 Part B) ─────────────────────────
+//
+// Channel-grant `_retention` rows hand a scoped member the derived key for one
+// channel. They are FORGEABLE-by-construction (the untrusted server stores
+// arbitrary ciphertext), so the guest must bind every grant row's authority:
+// grants may appear ONLY in (a) an InviteUser op, bound to the invitee's own
+// freshly-allocated `_users` row id, or (b) a rekey-path op (standalone `Rekey`
+// or member-removal `RemoveUser`), each grant bound to an EXISTING `_users` row
+// whose status is Scoped(2)/ScopedProvisional(3). Every other op that can carry
+// `_retention` writes (`Extend`, `Reduce`, `CreateSpace`) must reject grant
+// rows outright. Without this, a non-provisional member could append a forged
+// `sl2/channel_grant/{self}/{channel}` row via a generic retention op and a
+// later honest rekey would honor it — the decoy class Part A closed for
+// `_users` (commit b3b6940).
+
+/// Prefix for channel-grant records in the retention layer.
+///
+/// CANONICAL DEFINITION: `key_manager::channel_grant` — `GRANT_KEY_PREFIX`
+/// plus `grant_row_key` / `parse_grant_row_key` (`key_manager/src/channel_grant.rs`).
+/// The FF guest deliberately keeps its dependency set minimal and does NOT
+/// depend on `key_manager`, so the prefix and (a canonicalising superset of)
+/// the parse are reimplemented here. Keep the two in lockstep.
+pub(crate) const GRANT_KEY_PREFIX: &str = "sl2/channel_grant/";
+
+/// Decode a `_retention` "key"-column stored value into its logical string
+/// form, if it is a string. Retention "key" values are stored as string
+/// column values (`value_to_bytes(json!(s))`).
+fn retention_key_string(value: &[u8]) -> Option<String> {
+    bytes_to_value(value).ok()?.as_str().map(str::to_owned)
+}
+
+/// True if the given `_retention` "key"-column stored value is a channel-grant
+/// logical key (prefix match only). Canonicity is enforced separately in the
+/// binding path; ops that merely REJECT grant rows need only the prefix test,
+/// which catches non-canonical spellings too.
+pub(crate) fn is_channel_grant_key(key_value: &[u8]) -> bool {
+    retention_key_string(key_value).is_some_and(|s| s.starts_with(GRANT_KEY_PREFIX))
+}
+
+/// Parse a channel-grant logical key string into `(uid, channel)`, requiring
+/// STRICT CANONICAL FORM: `sl2/channel_grant/{uid}/{channel}` where `uid` and
+/// `channel` are non-negative decimal integers with no sign, no leading zeros,
+/// and no extra `/`-separated segments. Returns `None` for any non-canonical
+/// or non-grant string.
+///
+/// Canonicity is load-bearing: `i64::from_str` accepts "+5", "-5", "007", so
+/// without the non-negativity + exact round-trip checks a single logical
+/// (uid, channel) could be spelled many ways — letting a forged grant row bind
+/// to a uid the honest reader parses differently, or shadow a legitimate grant.
+fn parse_canonical_grant_key(s: &str) -> Option<(i64, i64)> {
+    let rest = s.strip_prefix(GRANT_KEY_PREFIX)?;
+    let mut parts = rest.split('/');
+    let uid_seg = parts.next()?;
+    let channel_seg = parts.next()?;
+    if parts.next().is_some() {
+        return None; // extra '/'-separated segments
+    }
+    let uid: i64 = uid_seg.parse().ok()?;
+    let channel: i64 = channel_seg.parse().ok()?;
+    // Reject negatives (rejects "-5") and non-canonical spellings via an exact
+    // round-trip (rejects "+5", "007", trailing/leading junk the split missed).
+    if uid < 0 || channel < 0 {
+        return None;
+    }
+    if format!("{GRANT_KEY_PREFIX}{uid}/{channel}") != s {
+        return None;
+    }
+    Some((uid, channel))
+}
+
+/// If `kv` is a `_retention` "key"-column entry whose stored value is a
+/// channel-grant logical key, return `Ok(Some(uid))` (the canonical uid).
+///
+/// Returns `Ok(None)` for any non-grant retention entry — including a
+/// grant-looking string in a NON-"key" column, which the retention reader
+/// never treats as a grant (grants are keyed by the "key" column only).
+/// Returns `Err` if the value IS grant-prefixed but not in canonical form.
+fn grant_key_uid_of_entry(kv: &KvData, op_name: &str) -> Result<Option<i64>, ChangelogError> {
+    let is_key_col = matches!(
+        parse_key(&kv.key),
+        Ok(ParsedKey::Column { table, column, .. })
+            if table == RETENTION_TABLE && column == "key"
+    );
+    if !is_key_col {
+        return Ok(None);
+    }
+    let Some(s) = retention_key_string(&kv.value) else {
+        return Ok(None); // "key" value is not a string → not a grant key
+    };
+    if !s.starts_with(GRANT_KEY_PREFIX) {
+        return Ok(None);
+    }
+    let (uid, _channel) = parse_canonical_grant_key(&s).ok_or_else(|| {
+        ChangelogError::Generic(format!(
+            "{op_name}: non-canonical channel_grant key '{s}' — grant keys must be \
+             '{GRANT_KEY_PREFIX}{{uid}}/{{channel}}' in canonical decimal form"
+        ))
+    })?;
+    Ok(Some(uid))
+}
+
+/// Reject any `_retention` entry that carries a channel-grant logical key.
+///
+/// Ops that are NOT an authorized grant path (`Extend`, `Reduce`,
+/// `CreateSpace`) call this so a member cannot forge a
+/// `sl2/channel_grant/{uid}/{channel}` row through a generic retention write.
+/// EVERY entry is checked (not just the first): a multi-row retention write in
+/// which one legitimate row hides a grant row still fails.
+pub(crate) fn reject_channel_grant_entries(
+    retention_entries: &[KvData],
+    op_name: &str,
+) -> Result<(), ChangelogError> {
+    for kv in retention_entries {
+        let is_key_col = matches!(
+            parse_key(&kv.key),
+            Ok(ParsedKey::Column { table, column, .. })
+                if table == RETENTION_TABLE && column == "key"
+        );
+        if is_key_col && is_channel_grant_key(&kv.value) {
+            return Err(ChangelogError::Generic(format!(
+                "{op_name}: channel_grant _retention rows are not allowed in {op_name} — \
+                 grants may only be written by invite/rekey"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that every channel-grant `_retention` row in `retention_entries`
+/// binds to an EXISTING `_users` row whose status is Scoped(2) or
+/// ScopedProvisional(3). Used by the two rekey paths — standalone `Rekey` and
+/// member-removal `RemoveUser` — which are the only ops that may (re)issue
+/// grants to already-joined scoped members.
+///
+/// Row-binding, decoy-proof (mirrors the Part A `refresh_keys` fix): the status
+/// is read for the grant row's OWN parsed uid (`column_key(_users, uid, status)`),
+/// never "the first status column by key order". Every grant-prefixed entry is
+/// validated individually, so one legitimate grant cannot smuggle others
+/// through. Non-canonical grant keys are rejected before any read.
+pub(crate) fn validate_scoped_grant_bindings(
+    retention_entries: &[KvData],
+    op_name: &str,
+    reader: &mut dyn OpReader,
+) -> Result<(), ChangelogError> {
+    for kv in retention_entries {
+        let Some(grant_uid) = grant_key_uid_of_entry(kv, op_name)? else {
+            continue; // not a grant "key" entry
+        };
+        let uid_u32 = u32::try_from(grant_uid).map_err(|_| {
+            ChangelogError::Generic(format!(
+                "{op_name}: channel_grant uid={grant_uid} is out of range for a _users row id"
+            ))
+        })?;
+        // Read THIS grant's own uid status specifically (not first-match).
+        // read_user_status errors if the row is absent → a grant for a
+        // nonexistent user is rejected.
+        let status = read_user_status(uid_u32, op_name, reader)?;
+        if !matches!(status, Some(2) | Some(3)) {
+            return Err(ChangelogError::Generic(format!(
+                "{op_name}: channel_grant row for uid={grant_uid} must bind to an existing \
+                 Scoped/ScopedProvisional _users row (status 2 or 3), got {status:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that every channel-grant `_retention` row in `retention_entries`
+/// binds to `invitee_uid` — the invitee's freshly-allocated `_users` row id.
+/// A scoped invite may hand the invitee its initial channel subtree keys via
+/// grant rows; each grant row's `{uid}` MUST equal the invited user's own row
+/// id, forbidding an inviter from smuggling a grant for a DIFFERENT (e.g. their
+/// own) uid through the invite path. Every grant row is validated; non-canonical
+/// grant keys are rejected.
+pub(crate) fn validate_invite_grant_bindings(
+    retention_entries: &[KvData],
+    invitee_uid: i64,
+    op_name: &str,
+) -> Result<(), ChangelogError> {
+    for kv in retention_entries {
+        if let Some(grant_uid) = grant_key_uid_of_entry(kv, op_name)? {
+            if grant_uid != invitee_uid {
+                return Err(ChangelogError::Generic(format!(
+                    "{op_name}: channel_grant row for uid={grant_uid} must bind to the \
+                     invited user's own row id ({invitee_uid})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Clone the per-entry keys out of a changelog entry.
 ///
 /// For row update/delete ops (and any op whose changelog entry already

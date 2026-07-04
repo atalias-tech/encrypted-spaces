@@ -2,9 +2,9 @@ use super::{
     append_insert_index_puts, append_multi_row_insert_index_puts, bump_next_id_after_chain,
     column_names_from_keys, derive_column_keys_for_chain, derive_column_keys_with_row_id,
     extract_i64_from_kh_entries, extract_value_from_kh_entries, partition_composite_entry,
-    read_kh_ranges_indexed, read_next_id, read_schema_columns,
-    validate_consistent_column_key_row_id, validate_key_history_entries, validate_user_access,
-    OpReader, OpVerifier, OpVerifyResult,
+    read_kh_ranges_indexed, read_next_id, read_schema_columns, validate_consistent_column_key_row_id,
+    validate_key_history_entries, validate_scoped_grant_bindings, validate_user_access, OpReader,
+    OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, ReadOp, TraceStep};
@@ -223,6 +223,12 @@ impl OpVerifier for RemoveUserOp {
 
         // --- Validate retention insert + derive keys from counter ---
         if !retention_entries.is_empty() {
+            // Member removal is the second authorized grant path: the server
+            // rekeys the group and (Task 5) re-bundles refreshed grants for the
+            // REMAINING scoped members. Each grant row must bind to an existing
+            // Scoped/ScopedProvisional _users row (read per grant's own uid).
+            validate_scoped_grant_bindings(&retention_entries, "remove_user", reader)?;
+
             let expected_retention_cols =
                 read_schema_columns(crate::RETENTION_TABLE, "remove_user", reader, ctx)?;
             let retention_entry_keys: Vec<Vec<u8>> =
@@ -568,6 +574,125 @@ mod tests {
             result.is_ok(),
             "expected Ok, got: {:?}",
             result.unwrap_err()
+        );
+    }
+
+    /// Build a RemoveUser entry that carries one channel-grant `_retention`
+    /// row (member-removal rekey path). kh + retention + user, table-sorted.
+    fn make_remove_entry_with_grant(
+        remover_uid: u32,
+        deleted_uid: u32,
+        grant_key: &str,
+    ) -> ChangelogEntry {
+        let row_id = deleted_uid as i64;
+        let user_keys = [
+            column_key("_users", row_id, "auth_key"),
+            column_key("_users", row_id, "status"),
+            column_key("_users", row_id, "update_key"),
+        ];
+        let mut entries: Vec<KvData> = make_kh_kvs(deleted_uid);
+        entries.push(KvData {
+            key: column_key_placeholder("_retention", "key"),
+            value: stored_str(grant_key),
+        });
+        entries.push(KvData {
+            key: column_key_placeholder("_retention", "value"),
+            value: vec![0xBB; 32],
+        });
+        for key in user_keys {
+            entries.push(KvData { key, value: vec![] });
+        }
+        ChangelogEntry {
+            timestamp: 1000,
+            uid: remover_uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::RemoveUser,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        }
+    }
+
+    /// A member-removal rekey may re-bundle a refreshed grant for a REMAINING
+    /// Scoped(2) member; the grant binds to that scoped uid and is accepted.
+    /// The grant-binding status read is spliced in right after the kh index-put
+    /// read and before the retention-write reads.
+    #[test]
+    fn test_channel_grant_scoped_uid_accepted_for_remove_user() {
+        let remover_uid = 1u32;
+        let deleted_uid = 5u32;
+        let grant_uid = 8i64; // a remaining scoped member
+        let entry = make_remove_entry_with_grant(
+            remover_uid,
+            deleted_uid,
+            &format!("sl2/channel_grant/{grant_uid}/7"),
+        );
+
+        let mut reads = verifier_reads(remover_uid, deleted_uid, &test_auth_key(), vec![]);
+        let guk = user_status_key(grant_uid as u32);
+        reads.insert(
+            6,
+            ProvenRead {
+                op: ReadOp::Key(guk.clone()),
+                results: vec![(guk, stored_i64(2))], // Scoped
+            },
+        );
+        let mut reader = VerifierReader::new(&reads);
+
+        let result = RemoveUserOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext {
+                current_change_id: 1,
+                action_name: None,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+    }
+
+    /// A member-removal rekey whose bundled grant binds to a Full(1) member is
+    /// rejected — grants only ever go to scoped members.
+    #[test]
+    fn test_channel_grant_full_uid_rejected_for_remove_user() {
+        let remover_uid = 1u32;
+        let deleted_uid = 5u32;
+        let grant_uid = 8i64;
+        let entry = make_remove_entry_with_grant(
+            remover_uid,
+            deleted_uid,
+            &format!("sl2/channel_grant/{grant_uid}/7"),
+        );
+
+        let mut reads = verifier_reads(remover_uid, deleted_uid, &test_auth_key(), vec![]);
+        let guk = user_status_key(grant_uid as u32);
+        reads.insert(
+            6,
+            ProvenRead {
+                op: ReadOp::Key(guk.clone()),
+                results: vec![(guk, stored_i64(1))], // Full → reject
+            },
+        );
+        let mut reader = VerifierReader::new(&reads);
+
+        let result = RemoveUserOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext {
+                current_change_id: 1,
+                action_name: None,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "grant to a Full member must be rejected");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("must bind to an existing") && msg.contains("uid=8"),
+            "expected a scoped-binding rejection, got: {msg}"
         );
     }
 
