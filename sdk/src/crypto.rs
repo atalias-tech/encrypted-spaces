@@ -1072,6 +1072,101 @@ mod tests {
         );
         Ok(())
     }
+
+    /// L2 Part B security: `refresh_scoped_keys` must verify each delivered
+    /// channel key against its ANCHORED on-chain grant commitment, not the
+    /// server-supplied envelope commitment. A malicious server that deposits a
+    /// wrong-but-self-consistent `(ciphertext, binding_commitment)` pair (the
+    /// old `decrypt_delivered_key`-only check would install it, since
+    /// `commit(key) == binding_commitment` holds) must be REJECTED: the agent
+    /// keeps its correct, anchored key and can still read its channel.
+    #[tokio::test]
+    async fn refresh_rejects_server_substituted_channel_key() -> Result<()> {
+        use encrypted_spaces_crypto::key_derivation::{
+            DerivationKoalaBearPoseidon2_16, KeyDerivation,
+        };
+        use encrypted_spaces_crypto::KeyMaterial;
+        use encrypted_spaces_key_manager::{
+            prove_channel_delivery, verify_channel_delivery, ScopedChannelDelivery,
+            ScopedDeliveryEnvelope,
+        };
+
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "legit ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent_uid = invite.id().expect("scoped invite carries a uid");
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Sanity: the agent reads its channel with the correct, anchored key.
+        let before: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(before.iter().any(|m| m.body == "legit ch1"));
+
+        // The agent's CURRENT update key (post-join rotation), from alice's view.
+        alice.recover_via_fast_forward().await?;
+        let agent_pk = alice
+            .users()
+            .select()
+            .all()
+            .await?
+            .into_iter()
+            .find(|u: &crate::users::UserRecord| u.id == Some(agent_uid))
+            .expect("agent is a member")
+            .update_key;
+
+        // Malicious server: deposit a self-consistent envelope for a WRONG key
+        // (commit(wrong) == its own binding_commitment, so the naive check would
+        // accept it), wrapped to the agent's real update key.
+        let wrong_key = KeyMaterial::digest(b"attacker-substituted-channel-key");
+        let wrong_commitment = DerivationKoalaBearPoseidon2_16::default().commit(&wrong_key);
+        let req =
+            prove_channel_delivery(1, wrong_commitment, &wrong_key, std::slice::from_ref(&agent_pk));
+        let cts = verify_channel_delivery(std::slice::from_ref(&agent_pk), &req)
+            .expect("bogus delivery is a well-formed mVE");
+        let bogus = ScopedDeliveryEnvelope {
+            channels: vec![ScopedChannelDelivery {
+                channel: 1,
+                binding_commitment: wrong_commitment,
+                ciphertext: cts.get(0).unwrap().clone(),
+            }],
+        };
+        transport
+            .server_state()
+            .lock()
+            .await
+            .key_delivery_slots
+            .put(agent_uid, serde_json::to_vec(&bogus).unwrap());
+
+        // The agent refreshes. The bogus delivery's commitment != the anchored
+        // grant commitment, so it must be SKIPPED (not installed). The agent
+        // keeps its correct key and still reads its channel. Under the old
+        // envelope-commitment check, the wrong key would be installed and this
+        // read would return zero rows.
+        agent.refresh_scoped_keys().await?;
+        let after: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            after.iter().any(|m| m.body == "legit ch1"),
+            "server-substituted channel key must be rejected; agent keeps its anchored key"
+        );
+        Ok(())
+    }
 }
 
 fn query_param_to_value(param: &QueryParam) -> serde_json::Value {

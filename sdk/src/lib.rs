@@ -338,10 +338,24 @@ impl Space {
         let envelope_bytes = transport.fetch_my_key_delivery().await?.ok_or_else(|| {
             SdkError::JoinError("no GK delivery slot found for invitee".to_string())
         })?;
+        // The invitee's server-assigned uid, captured before the keypairs are
+        // moved into the key manager. Needed to look up its anchored channel
+        // grants when bootstrapping a scoped member.
+        let my_uid = invite.user.id;
+
         // Bootstrap the key chain from the delivered envelope. A full member
         // gets a group-key envelope (GkDeliveryEnvelope); a scoped member (L2)
         // gets a ScopedDeliveryEnvelope carrying only its channel subtree keys.
         // The two have disjoint fields, so try the full one first.
+        //
+        // For a scoped member we DEFER installing the channel keys: they must
+        // be verified against the ANCHORED `_retention` grant commitments (the
+        // STARK-proven state), which only become available after
+        // `restore_internal` fast-forwards. Building an empty scoped read plane
+        // here and installing after the FF closes the same server-substitution
+        // gap `refresh_scoped_keys` guards against.
+        let mut scoped_envelope: Option<encrypted_spaces_key_manager::ScopedDeliveryEnvelope> =
+            None;
         let key_manager: SpaceKeyManager = if let Ok(envelope) =
             serde_json::from_slice::<GkDeliveryEnvelope>(&envelope_bytes)
         {
@@ -356,26 +370,12 @@ impl Space {
                 serde_json::from_slice(&envelope_bytes).map_err(|e| {
                     SdkError::JoinError(format!("invalid delivery envelope: {e}"))
                 })?;
-            // Build a scoped read plane and install each delivered channel key.
-            // `decrypt_delivered_key` verifies each key against its commitment.
-            let mut km: SpaceKeyManager = KeyManager::new(
+            scoped_envelope = Some(scoped);
+            KeyManager::new(
                 invite.user.update_key_pair,
                 invite.user.auth_key_pair,
                 TreeSpaceKey::scoped(std::iter::empty()),
-            );
-            let mut channel_keys = Vec::with_capacity(scoped.channels.len());
-            for ch in &scoped.channels {
-                let key = km
-                    .decrypt_delivered_key(&ch.ciphertext, ch.binding_commitment)
-                    .map_err(|_| {
-                        SdkError::JoinError("failed to decrypt scoped channel key".into())
-                    })?;
-                channel_keys.push((ch.channel, key));
-            }
-            for (ch, key) in channel_keys {
-                km.space_key_mut().install_channel_key(ch, key);
-            }
-            km
+            )
         };
 
         let (dc, table_schemas, actions, ff_image_id) = schema.into_parts().await?;
@@ -404,6 +404,26 @@ impl Space {
             key_manager,
         )
         .await?;
+
+        // Scoped bootstrap: `restore_internal` has fast-forwarded, so the
+        // anchored channel-grant rows are now in proven state. Install each
+        // delivered channel key only if it matches its on-chain grant
+        // commitment. A scoped member that can verify NONE of its delivered
+        // channels has not bootstrapped — fail closed.
+        if let Some(scoped) = scoped_envelope {
+            let uid = my_uid.ok_or_else(|| {
+                SdkError::JoinError("scoped invite is missing its assigned uid".into())
+            })?;
+            let installed = space
+                .install_scoped_channels_verified(uid, &scoped.channels)
+                .await?;
+            if installed == 0 && !scoped.channels.is_empty() {
+                return Err(SdkError::JoinError(
+                    "no delivered scoped channel key matched its anchored on-chain grant"
+                        .to_string(),
+                ));
+            }
+        }
 
         // Rotate provisional invite keypairs → fresh permanent keypairs.
         space.rotate_user_keys().await?;
@@ -582,7 +602,9 @@ impl Space {
     /// NOTE (Task 6 boundary): this is the full client primitive. Task 6 only
     /// wires it into the agent runtime (auto-invoked on rekey detection).
     pub async fn refresh_scoped_keys(&self) -> Result<()> {
-        // Advance the local snapshot so reads see the post-rekey epoch + rows.
+        // Advance the local snapshot so reads see the post-rekey epoch + rows,
+        // AND so the anchored `_retention` channel-grant rows we verify against
+        // below are present in proven state.
         self.sync().await?;
 
         // A full member derives channel keys from the group key; nothing to
@@ -599,39 +621,101 @@ impl Space {
         };
 
         // A scoped member's slot always holds a ScopedDeliveryEnvelope (never a
-        // group-key envelope — the §8 leak-closure invariant). Decrypt each
-        // channel key with our current update key and re-install it, replacing
-        // the now-stale prior-epoch subtree keys.
+        // group-key envelope — the §8 leak-closure invariant). Install each
+        // channel key ONLY if it matches its anchored on-chain grant commitment
+        // (see `install_scoped_channels_verified`), so a malicious server cannot
+        // substitute a key. Skip-and-continue is availability-robust.
         let scoped: encrypted_spaces_key_manager::ScopedDeliveryEnvelope =
             serde_json::from_slice(&bytes).map_err(|e| {
                 SdkError::ValidationError(format!("invalid scoped delivery envelope: {e}"))
             })?;
+        let Some(my_uid) = self.with_state(|s| s.auth_context.uid) else {
+            return Ok(());
+        };
+        self.install_scoped_channels_verified(my_uid, &scoped.channels)
+            .await?;
+        Ok(())
+    }
+
+    /// Install a scoped member's delivered channel keys, verifying each against
+    /// the ANCHORED `_retention` channel-grant commitment (the STARK-proven
+    /// state the client already verifies) rather than the SERVER-supplied
+    /// envelope commitment.
+    ///
+    /// `decrypt_delivered_key` only checks `commit(key) == binding_commitment`,
+    /// and BOTH the ciphertext and `binding_commitment` come from the untrusted
+    /// server's delivery slot — so a malicious server could deliver a
+    /// wrong-but-self-consistent `(ciphertext, binding_commitment)` pair and
+    /// have it silently installed. Binding each key to the on-chain grant
+    /// commitment (what a FULL member actually derived + committed, verified via
+    /// STARK) closes that gap. A channel whose grant row is absent, whose
+    /// delivery commitment mismatches the anchor, or that fails to decrypt is
+    /// SKIPPED (logged), never installed — and skipping one channel does not
+    /// abort the others (a server cannot suppress refresh of a member's whole
+    /// scope by poisoning a single channel). Returns the count installed.
+    ///
+    /// Precondition: the caller has advanced the proven retention snapshot
+    /// (join's `restore_internal` fast-forward, or `refresh_scoped_keys`'
+    /// `sync`) so the anchored grant rows are present.
+    pub(crate) async fn install_scoped_channels_verified(
+        &self,
+        my_uid: i64,
+        channels: &[encrypted_spaces_key_manager::ScopedChannelDelivery],
+    ) -> Result<usize> {
+        use encrypted_spaces_crypto::KeyCommitment;
+        use encrypted_spaces_key_manager::channel_grant::grant_row_key;
+
+        // Phase 1 (async proven reads, no key-manager lock): resolve each
+        // channel's anchored grant commitment; keep only deliveries that match.
+        let mut verified: Vec<(usize, KeyCommitment)> = Vec::with_capacity(channels.len());
+        for (i, ch) in channels.iter().enumerate() {
+            let key = grant_row_key(my_uid, ch.channel);
+            let rec: Option<crate::retention::RetentionRecord> = self
+                .retention_table()
+                .select()
+                .where_eq("key", key.as_str())
+                .last()
+                .await?;
+            let Some(anchored) = rec.and_then(|r| KeyCommitment::from_bytes(&r.value)) else {
+                log::warn!(
+                    "[SDK] scoped install: no anchored channel-grant row for channel {}; skipping",
+                    ch.channel
+                );
+                continue;
+            };
+            if ch.binding_commitment != anchored {
+                log::warn!(
+                    "[SDK] scoped install: channel {} delivery commitment != anchored grant \
+                     commitment; skipping (server may be substituting a key)",
+                    ch.channel
+                );
+                continue;
+            }
+            verified.push((i, anchored));
+        }
+
+        // Phase 2 (key-manager lock): decrypt against the ANCHORED commitment
+        // (not the envelope's) and install. A ciphertext that does not decrypt
+        // to the anchored key fails here and is skipped.
         let mut km = self.key_manager.lock().await;
-        let mut installs = Vec::with_capacity(scoped.channels.len());
-        for ch in &scoped.channels {
-            match km.decrypt_delivered_key(&ch.ciphertext, ch.binding_commitment) {
-                Ok(key) => installs.push((ch.channel, key)),
+        let mut installed = 0usize;
+        for (i, anchored) in verified {
+            let ch = &channels[i];
+            match km.decrypt_delivered_key(&ch.ciphertext, anchored) {
+                Ok(key) => {
+                    km.space_key_mut().install_channel_key(ch.channel, key);
+                    installed += 1;
+                }
                 Err(_) => {
-                    // The slot holds material not addressed to our current
-                    // update key — e.g. the pre-rotation invite envelope when
-                    // no rekey has re-delivered yet, or (untrusted server)
-                    // garbage. Neither can leak a key; the worst case is we keep
-                    // our existing channel keys. Leave them intact and report
-                    // success so a proactive/spurious refresh is a safe no-op —
-                    // a real rekey deposits a fresh, decryptable slot.
-                    log::debug!(
-                        "[SDK] refresh_scoped_keys: slot channel {} not decryptable with \
-                         current key; keeping installed keys",
+                    log::warn!(
+                        "[SDK] scoped install: channel {} failed to decrypt against anchored \
+                         commitment; skipping",
                         ch.channel
                     );
-                    return Ok(());
                 }
             }
         }
-        for (ch, key) in installs {
-            km.space_key_mut().install_channel_key(ch, key);
-        }
-        Ok(())
+        Ok(installed)
     }
 
     /// Whether this member currently holds the group key (full read access),
