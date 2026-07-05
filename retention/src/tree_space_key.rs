@@ -102,15 +102,36 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
     /// one commitment, one proof.
     pub fn prove_channel_grant(&self, channel: i64) -> Option<Vec<u8>> {
         let group_key = self.group.as_ref()?.current_group_key();
-        let channel_key = channel_root(&group_key, channel);
-        P::default()
+        self.channel_grant_for_group_key(&group_key, channel)
+            .map(|(_subtree, proof)| proof)
+    }
+
+    /// Derive `(subtree key, §4.3 grant proof)` for `channel` from an
+    /// **explicit** `group_key`, rather than the currently installed one.
+    ///
+    /// This is the rekey re-delivery counterpart to [`Self::channel_subtree_key`]
+    /// + [`Self::prove_channel_grant`] (which derive from the installed group
+    /// key): during a rekey the NEW group key is freshly generated and not yet
+    /// installed locally, so scoped members' refreshed channel keys must be
+    /// derived against the caller-supplied new key. The returned subtree key is
+    /// the mVE delivery payload; its commitment serves as both the delivery
+    /// `binding_commitment` and the persisted grant record — one key, one
+    /// commitment, one proof.
+    pub fn channel_grant_for_group_key(
+        &self,
+        group_key: &KeyMaterial,
+        channel: i64,
+    ) -> Option<(KeyMaterial, Vec<u8>)> {
+        let channel_key = channel_root(group_key, channel);
+        let proof = P::default()
             .prove_channel_grant_runtime(ChannelGrantProofInput {
                 derivation: &DefaultDerivation::default(),
-                group_key,
+                group_key: group_key.clone(),
                 channel,
-                channel_key,
+                channel_key: channel_key.clone(),
             })
-            .ok()
+            .ok()?;
+        Some((channel_key, proof))
     }
 
     /// Install a delivered channel subtree key (scoped grant).

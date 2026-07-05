@@ -39,13 +39,13 @@ use encrypted_spaces_ffproof::common::FFProof;
 use encrypted_spaces_ffproof::prover::{
     prepare_ff_pruned_tree, prove_ff_chunk, update_changelog_proof,
 };
-use encrypted_spaces_key_manager::operation::AsyncReader;
+use encrypted_spaces_key_manager::operation::{AsyncReader, OperationReader};
 use encrypted_spaces_key_manager::{
     verify_channel_delivery, verify_invite, verify_rekey, CollectingOperationBuilder, DefaultMkem,
     GkDeliveryEnvelope, InviteRequest, KeyManagerError, PendingWritesView, RekeyRequest,
-    ScopedChannelDelivery, ScopedDeliveryEnvelope, ScopedInviteRequest, SpaceKey,
+    ScopedChannelDelivery, ScopedDeliveryEnvelope, ScopedInviteRequest, ScopedRegrant, SpaceKey,
 };
-use encrypted_spaces_key_manager::channel_grant::parse_grant_row_key;
+use encrypted_spaces_key_manager::channel_grant::{grant_row_key, parse_grant_row_key};
 use encrypted_spaces_retention::tree_space_key::{verify_channel_grant, TreeSpaceKey};
 use encrypted_spaces_storage_encoding::{action_storage_key, decode_action_value, hashstore_hash};
 use once_cell::sync::Lazy;
@@ -3430,6 +3430,21 @@ impl SpaceState {
         )
         .await?;
 
+        // 4b. L2 Part B: verify the surviving scoped members' refreshed channel
+        //     grants against the AUTHORITATIVE new group key (just bound above)
+        //     and build their fresh ScopedDeliveryEnvelopes. Runs before the
+        //     change lands, so a bad re-grant aborts the removal. `rows` is the
+        //     pre-op `_users` snapshot; the removed uid(s) are excluded.
+        let scoped_envelopes = self
+            .verify_scoped_regrants_and_build_envelopes(
+                delete_change,
+                &request.new_root_commitment,
+                &request.scoped_regrants,
+                &rows,
+                &removed_in_change,
+            )
+            .await?;
+
         // 5. Execute the change.
         let change_response = self.handle_change(delete_change, auth).await?;
 
@@ -3439,8 +3454,9 @@ impl SpaceState {
         }
 
         // 8. Refresh each non-scoped recipient's GK delivery slot with their
-        //    rekey envelope. Scoped members are skipped, so their existing
-        //    (channel-key-only) slots are left untouched. Slot writes are
+        //    rekey envelope. Scoped members do NOT get a group-key envelope;
+        //    instead their slot is overwritten below with a fresh
+        //    ScopedDeliveryEnvelope (channel keys only). Slot writes are
         //    best-effort; the canonical retention mutation has already
         //    committed above.
         for (i, (uid, _)) in gk_recipients.iter().enumerate() {
@@ -3455,6 +3471,13 @@ impl SpaceState {
                 ServerError::Generic(format!("delivery envelope serialization failed: {e}"))
             })?;
             self.key_delivery_slots.put(*uid, envelope_bytes);
+        }
+
+        // 9. Re-deposit each surviving scoped member's refreshed
+        //    ScopedDeliveryEnvelope (channel keys only, no group key), so it
+        //    keeps reading its channels across the rekey (L2 Part B).
+        for (uid, envelope_bytes) in scoped_envelopes {
+            self.key_delivery_slots.put(uid, envelope_bytes);
         }
 
         Ok(change_response)
@@ -3537,6 +3560,24 @@ impl SpaceState {
                 })?;
                 envelopes.push((*uid, envelope_bytes));
             }
+
+            // L2 Part B: verify the scoped members' refreshed channel grants
+            // against the AUTHORITATIVE new group key (bound above) and append
+            // their fresh ScopedDeliveryEnvelopes. A standalone rekey removes no
+            // one, so the removed-uid set is empty. Scoped uids are disjoint
+            // from the full members above (scoped rows are filtered out of
+            // `members`), so the two envelope sets never target the same slot.
+            let scoped_envelopes = self
+                .verify_scoped_regrants_and_build_envelopes(
+                    change,
+                    &request.new_root_commitment,
+                    &request.scoped_regrants,
+                    &rows,
+                    &BTreeSet::new(),
+                )
+                .await?;
+            envelopes.extend(scoped_envelopes);
+
             Some(envelopes)
         } else {
             None
@@ -3641,6 +3682,212 @@ impl SpaceState {
             ));
         }
         Ok(())
+    }
+
+    /// Verify a rekey's scoped re-grants (L2 Part B) and build the fresh
+    /// `ScopedDeliveryEnvelope` bytes to deposit per surviving scoped member.
+    ///
+    /// This is the rekey counterpart to the scoped-invite verification in
+    /// [`Self::handle_scoped_add_member`]. `new_group_commitment` MUST be the
+    /// AUTHORITATIVE post-rekey group-key commitment — the caller passes
+    /// `request.new_root_commitment` only after
+    /// [`Self::verify_rekey_new_root_commitment_from_change`] has bound it to
+    /// the retention writes, so it is never a client-chosen value.
+    ///
+    /// For every re-granted channel this enforces, rejecting the whole op on
+    /// any failure:
+    ///   1. **Pre-existence (no scope expansion)** — a grant row for
+    ///      `(uid, channel)` existed in PRE-OP retention state; a rekey may only
+    ///      REFRESH channels a member already held, never add new ones.
+    ///   2. **Binding** — the grant `_retention` row the signed op persists
+    ///      commits the SAME key the mVE delivers.
+    ///   3. **Derivation** — that committed key is a §4.3 derivation of the NEW
+    ///      group key.
+    ///   4. **Delivery target** — the mVE is wrapped to the member's CURRENT
+    ///      `_users` update key, so only that member can decrypt it.
+    ///   5. **Coverage** — every channel-grant row carried in the signed op is
+    ///      covered by exactly one verified re-grant (no un-verified grant row
+    ///      lands, no double delivery).
+    ///
+    /// `removed_uids` (removal path) are excluded from the scoped-member set so
+    /// the member being removed is never re-delivered to (the guest also
+    /// rejects a grant for the removed uid).
+    async fn verify_scoped_regrants_and_build_envelopes(
+        &self,
+        change: &Change,
+        new_group_commitment: &KeyCommitment,
+        scoped_regrants: &[ScopedRegrant],
+        users_rows: &[serde_json::Value],
+        removed_uids: &BTreeSet<i64>,
+    ) -> Result<Vec<(i64, Vec<u8>)>, ServerError> {
+        if scoped_regrants.is_empty() {
+            // No re-grants requested: still enforce that the signed op carries
+            // no orphan channel-grant rows (coverage), so an attacker cannot
+            // land an un-verified grant row by omitting its delivery.
+            for (key, _value) in extract_retention_writes_from_change(change) {
+                if parse_grant_row_key(&key).is_some() {
+                    return Err(ServerError::Generic(
+                        "rekey carries a channel-grant row with no verified re-grant".to_string(),
+                    ));
+                }
+            }
+            return Ok(Vec::new());
+        }
+
+        // Scoped members' CURRENT update keys, from PRE-OP `_users` (status 2/3),
+        // excluding any uid being removed.
+        let mut scoped_pk: HashMap<i64, <DefaultMkem as Mkem>::PublicKey> = HashMap::new();
+        for row in users_rows {
+            let Some(id) = row.get("id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if removed_uids.contains(&id) {
+                continue;
+            }
+            let Some(status) = row.get("status").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if !status_is_scoped(status) {
+                continue;
+            }
+            let Some(b64) = row.get("update_key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(json_bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+                continue;
+            };
+            let Ok(pk) = serde_json::from_slice(&json_bytes) else {
+                continue;
+            };
+            scoped_pk.insert(id, pk);
+        }
+
+        // Channel-grant rows carried in the signed op (raw commitment bytes).
+        // Non-grant rows (the fgk rekey writes) are ignored here.
+        let mut grant_rows: HashMap<(i64, i64), KeyCommitment> = HashMap::new();
+        for (key, value) in extract_retention_writes_from_change(change) {
+            let Some((uid, channel)) = parse_grant_row_key(&key) else {
+                continue;
+            };
+            let commitment = KeyCommitment::from_bytes(&value).ok_or_else(|| {
+                ServerError::Generic("channel-grant row has a malformed commitment".to_string())
+            })?;
+            if grant_rows.insert((uid, channel), commitment).is_some() {
+                return Err(ServerError::Generic(format!(
+                    "rekey has duplicate channel-grant rows for uid {uid} channel {channel}"
+                )));
+            }
+        }
+
+        let pre_state = self.retention_reader();
+        let mut consumed: BTreeSet<(i64, i64)> = BTreeSet::new();
+        let mut envelopes = Vec::with_capacity(scoped_regrants.len());
+        for regrant in scoped_regrants {
+            let pk = scoped_pk.get(&regrant.uid).ok_or_else(|| {
+                ServerError::Generic(format!(
+                    "rekey re-grant targets uid {} which is not a surviving scoped member",
+                    regrant.uid
+                ))
+            })?;
+            let mut deliveries = Vec::with_capacity(regrant.channels.len());
+            for cr in &regrant.channels {
+                let channel = cr.delivery.channel;
+
+                // (1) No scope expansion: the grant must have PRE-EXISTED.
+                let pre_key = grant_row_key(regrant.uid, channel);
+                let pre_existing = pre_state
+                    .get(&pre_key)
+                    .await
+                    .map_err(|_| {
+                        ServerError::Generic(
+                            "failed to read pre-op channel-grant state".to_string(),
+                        )
+                    })?
+                    .is_some();
+                if !pre_existing {
+                    return Err(ServerError::Generic(format!(
+                        "rekey re-grant expands scope: uid {} was not previously granted \
+                         channel {channel}",
+                        regrant.uid
+                    )));
+                }
+
+                // (2) Binding: the persisted grant row commits the delivered key.
+                let grant_commitment =
+                    grant_rows.get(&(regrant.uid, channel)).ok_or_else(|| {
+                        ServerError::Generic(format!(
+                            "re-granted channel {channel} for uid {} has no matching \
+                             channel-grant row in the signed op",
+                            regrant.uid
+                        ))
+                    })?;
+                if *grant_commitment != cr.delivery.commitment {
+                    return Err(ServerError::Generic(format!(
+                        "uid {} channel {channel} grant commitment does not equal the \
+                         delivered binding commitment",
+                        regrant.uid
+                    )));
+                }
+
+                // (3) Derivation: the committed key is a §4.3 derivation of the
+                //     AUTHORITATIVE new group key.
+                verify_channel_grant(
+                    channel,
+                    *new_group_commitment,
+                    *grant_commitment,
+                    &cr.grant_proof,
+                )
+                .map_err(|_| {
+                    ServerError::Generic(format!(
+                        "uid {} channel {channel} re-grant derivation proof verification failed",
+                        regrant.uid
+                    ))
+                })?;
+
+                // (4) Delivery target: the mVE is wrapped to the member's own
+                //     current update key.
+                let ciphertexts =
+                    verify_channel_delivery(std::slice::from_ref(pk), &cr.delivery).map_err(
+                        |_| {
+                            ServerError::Generic(format!(
+                                "uid {} channel {channel} re-grant delivery mVE verification failed",
+                                regrant.uid
+                            ))
+                        },
+                    )?;
+                let ciphertext = ciphertexts.get(0).ok_or_else(|| {
+                    ServerError::Generic("missing re-grant ciphertext".to_string())
+                })?;
+
+                if !consumed.insert((regrant.uid, channel)) {
+                    return Err(ServerError::Generic(format!(
+                        "duplicate re-grant for uid {} channel {channel}",
+                        regrant.uid
+                    )));
+                }
+                deliveries.push(ScopedChannelDelivery {
+                    channel,
+                    binding_commitment: cr.delivery.commitment,
+                    ciphertext: ciphertext.clone(),
+                });
+            }
+            let envelope = ScopedDeliveryEnvelope {
+                channels: deliveries,
+            };
+            let envelope_bytes = serde_json::to_vec(&envelope).map_err(|e| {
+                ServerError::Generic(format!("scoped delivery envelope serialization failed: {e}"))
+            })?;
+            envelopes.push((regrant.uid, envelope_bytes));
+        }
+
+        // (5) Coverage: every channel-grant row in the signed op was verified.
+        if consumed.len() != grant_rows.len() {
+            return Err(ServerError::Generic(
+                "rekey carries channel-grant rows not covered by verified re-grants".to_string(),
+            ));
+        }
+
+        Ok(envelopes)
     }
 
     /// Build a `CollectingOperationBuilder` whose reader queries the

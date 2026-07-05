@@ -12,6 +12,39 @@ use serde::{Deserialize, Serialize};
 pub struct RekeyRequest {
     pub new_root_commitment: KeyCommitment,
     pub proof: PoseidonMveProof<DefaultMkem>,
+    /// Surviving scoped members' refreshed channel grants (L2 Part B rekey
+    /// re-delivery). A rekey rotates the group key, so each channel's subtree
+    /// key changes; without this, scoped members go dark on their channels.
+    /// Empty when no scoped members exist. `#[serde(default)]` keeps the wire
+    /// format backward-compatible with pre-Part-B rekeys.
+    #[serde(default)]
+    pub scoped_regrants: Vec<ScopedRegrant>,
+}
+
+/// One channel's refreshed grant during a rekey re-delivery (L2 Part B): the
+/// mVE delivery of the channel's NEW-epoch subtree key to a scoped member,
+/// paired with the §4.3 derivation proof binding that key to the NEW group key.
+/// The server verifies both before re-depositing the member's delivery slot.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChannelRegrant {
+    pub delivery: ChannelDeliveryRequest,
+    /// §4.3 channel-grant derivation proof (opaque STARK bytes), the rekey
+    /// counterpart to [`ScopedInviteRequest::grant_proofs`].
+    pub grant_proof: Vec<u8>,
+}
+
+/// A surviving scoped member's refreshed channel grants for a rekey (L2 Part
+/// B). The server re-derives nothing: it verifies each [`ChannelRegrant`]
+/// against the AUTHORITATIVE new group-key commitment (never client-supplied)
+/// and the grant `_retention` rows the signed op persists, that each channel
+/// was ALREADY granted (no scope expansion), and that the delivery is wrapped
+/// to `uid`'s current update key — then re-deposits a fresh
+/// [`ScopedDeliveryEnvelope`] in `uid`'s slot so the member keeps reading its
+/// channels across the rekey.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScopedRegrant {
+    pub uid: i64,
+    pub channels: Vec<ChannelRegrant>,
 }
 
 /// Server -> remaining members: verified rekey result.

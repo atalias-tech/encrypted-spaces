@@ -972,6 +972,106 @@ mod tests {
 
         Ok(())
     }
+
+    /// L2 Part B CROWN JEWEL: a scoped member keeps reading NEW messages in its
+    /// channel across a rekey. A rekey rotates the group key, so every channel's
+    /// subtree key (`channel_root(group_key, channel)`) changes; without
+    /// re-delivery the scoped member's installed key goes stale and it can no
+    /// longer decrypt post-rekey rows. The rekey path (here a member removal)
+    /// must re-derive + re-deliver each surviving scoped member's channel key
+    /// against the NEW epoch, and `refresh_scoped_keys` re-installs it.
+    #[tokio::test]
+    async fn scoped_member_reads_new_message_after_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // A scoped agent joins channel 1 (holds no group key).
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Force a REAL rekey (new group-key epoch): add + remove a throwaway
+        // full member. Capture its uid before `join` consumes the invite.
+        let throwaway = alice.invite_user().await?;
+        let throwaway_uid = throwaway.id().expect("full invite carries a uid");
+        let _tj = crate::Space::join(transport.clone(), throwaway, schema()).await?;
+        // Converge alice's `_users` cache on both members' post-join rotations
+        // before building the removal's rekey (same reasoning as the leak tests).
+        alice.recover_via_fast_forward().await?;
+        alice.remove_user(throwaway_uid).await?; // triggers the group rekey
+
+        // Alice posts a NEW ch1 message under the new epoch.
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "post-rekey ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        // The scoped agent re-fetches its refreshed channel key and reads it.
+        agent.refresh_scoped_keys().await?; // Task 6 auto-invokes; here explicit.
+        let rows: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "post-rekey ch1"),
+            "scoped agent must read a NEW ch1 message after a rekey"
+        );
+        Ok(())
+    }
+
+    /// L2 Part B, standalone-rekey path: the crown-jewel test above drives the
+    /// member-removal rekey (`handle_remove_member`); a STANDALONE rekey
+    /// (`Space::rekey` → `handle_retention`) is the other path that rotates the
+    /// group key, and a scoped member must keep reading its channel across it
+    /// too. Confirms the re-delivery works on both paths.
+    #[tokio::test]
+    async fn scoped_member_reads_new_message_after_standalone_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Converge alice's `_users` cache on the agent's post-join rotation, then
+        // do a STANDALONE rekey (no removal) — a fresh group-key epoch.
+        alice.recover_via_fast_forward().await?;
+        alice.rekey().await?;
+
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "post-standalone-rekey ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        agent.refresh_scoped_keys().await?;
+        let rows: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "post-standalone-rekey ch1"),
+            "scoped agent must read a NEW ch1 message after a standalone rekey"
+        );
+        Ok(())
+    }
 }
 
 fn query_param_to_value(param: &QueryParam) -> serde_json::Value {

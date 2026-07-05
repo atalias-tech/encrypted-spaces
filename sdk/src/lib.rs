@@ -569,6 +569,71 @@ impl Space {
         self.recover_via_fast_forward().await
     }
 
+    /// Refresh a scoped member's channel subtree keys after a rekey (L2 Part B).
+    ///
+    /// A rekey rotates the group key, so every channel's subtree key
+    /// (`channel_root(group_key, channel)`) changes. On both rekey paths the
+    /// server re-derives and re-deposits a fresh `ScopedDeliveryEnvelope` for
+    /// each surviving scoped member; this advances the local snapshot, fetches
+    /// that envelope, and re-installs the channel keys so the member keeps
+    /// reading NEW rows in its channels. A full member derives channel keys
+    /// from the group key on the fly, so this is a no-op for it.
+    ///
+    /// NOTE (Task 6 boundary): this is the full client primitive. Task 6 only
+    /// wires it into the agent runtime (auto-invoked on rekey detection).
+    pub async fn refresh_scoped_keys(&self) -> Result<()> {
+        // Advance the local snapshot so reads see the post-rekey epoch + rows.
+        self.sync().await?;
+
+        // A full member derives channel keys from the group key; nothing to
+        // refresh. (Also avoids fetching a GK envelope as if it were scoped.)
+        if self.key_manager.lock().await.space_key().is_full() {
+            return Ok(());
+        }
+
+        // Fetch the (server-refreshed) scoped delivery slot. `None` means no
+        // slot material yet — e.g. no rekey has re-delivered — so leave the
+        // installed keys as-is rather than tearing them down.
+        let Some(bytes) = self.transport.fetch_my_key_delivery().await? else {
+            return Ok(());
+        };
+
+        // A scoped member's slot always holds a ScopedDeliveryEnvelope (never a
+        // group-key envelope — the §8 leak-closure invariant). Decrypt each
+        // channel key with our current update key and re-install it, replacing
+        // the now-stale prior-epoch subtree keys.
+        let scoped: encrypted_spaces_key_manager::ScopedDeliveryEnvelope =
+            serde_json::from_slice(&bytes).map_err(|e| {
+                SdkError::ValidationError(format!("invalid scoped delivery envelope: {e}"))
+            })?;
+        let mut km = self.key_manager.lock().await;
+        let mut installs = Vec::with_capacity(scoped.channels.len());
+        for ch in &scoped.channels {
+            match km.decrypt_delivered_key(&ch.ciphertext, ch.binding_commitment) {
+                Ok(key) => installs.push((ch.channel, key)),
+                Err(_) => {
+                    // The slot holds material not addressed to our current
+                    // update key — e.g. the pre-rotation invite envelope when
+                    // no rekey has re-delivered yet, or (untrusted server)
+                    // garbage. Neither can leak a key; the worst case is we keep
+                    // our existing channel keys. Leave them intact and report
+                    // success so a proactive/spurious refresh is a safe no-op —
+                    // a real rekey deposits a fresh, decryptable slot.
+                    log::debug!(
+                        "[SDK] refresh_scoped_keys: slot channel {} not decryptable with \
+                         current key; keeping installed keys",
+                        ch.channel
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        for (ch, key) in installs {
+            km.space_key_mut().install_channel_key(ch, key);
+        }
+        Ok(())
+    }
+
     /// Whether this member currently holds the group key (full read access),
     /// as opposed to a scoped member, which holds only delivered channel
     /// subtree keys and never the group key. Test-only: asserts the
