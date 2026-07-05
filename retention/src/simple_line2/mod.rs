@@ -13,9 +13,9 @@ mod store;
 mod tests;
 
 pub use proof::{
-    DefaultDerivation, DeleteKeysProofInput, DeleteKeysSurvivor, DeleteKeysVerifyInput,
-    ExtendProofInput, ExtendVerifyInput, NoProver, RekeyProofInput, RekeyVerifyInput,
-    SimpleLine2Proofs, SimpleLine2RuntimeProver, VecProofs,
+    ChannelGrantProofInput, ChannelGrantVerifyInput, DefaultDerivation, DeleteKeysProofInput,
+    DeleteKeysSurvivor, DeleteKeysVerifyInput, ExtendProofInput, ExtendVerifyInput, NoProver,
+    RekeyProofInput, RekeyVerifyInput, SimpleLine2Proofs, SimpleLine2RuntimeProver, VecProofs,
 };
 pub use space_key::SimpleLine2SpaceKey;
 pub use stark_proofs::StarkProver;

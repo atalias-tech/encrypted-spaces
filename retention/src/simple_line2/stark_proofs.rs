@@ -454,6 +454,21 @@ impl super::proof::SimpleLine2RuntimeProver for StarkProver {
     ) -> Result<(), KeyManagerError> {
         <Self as SimpleLine2Proofs<DefaultDerivation>>::verify_delete_keys(self, input, proof)
     }
+
+    fn prove_channel_grant_runtime(
+        &self,
+        input: ChannelGrantProofInput<'_, DefaultDerivation>,
+    ) -> Result<Vec<u8>, KeyManagerError> {
+        <Self as SimpleLine2Proofs<DefaultDerivation>>::prove_channel_grant(self, input)
+    }
+
+    fn verify_channel_grant_runtime(
+        &self,
+        input: ChannelGrantVerifyInput,
+        proof: &[u8],
+    ) -> Result<(), KeyManagerError> {
+        <Self as SimpleLine2Proofs<DefaultDerivation>>::verify_channel_grant(self, input, proof)
+    }
 }
 
 // ---------------------------------------------------------------------------

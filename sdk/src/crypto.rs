@@ -386,6 +386,63 @@ mod tests {
         Ok(())
     }
 
+    /// L2 Part B (Task 4): a scoped invite must commit a `_retention`
+    /// channel-grant record per granted channel. Each record commits the SAME
+    /// `KeyCommitment` the mVE delivery binds — so the persisted grant ≡ the
+    /// delivered channel key — and the server only lets the rows land after
+    /// verifying each grant's derivation proof, so their presence is proof the
+    /// server accepted them.
+    #[tokio::test]
+    async fn scoped_invite_writes_grant_records() -> Result<()> {
+        use encrypted_spaces_crypto::KeyCommitment;
+        use encrypted_spaces_key_manager::channel_grant::grant_row_key;
+        use encrypted_spaces_key_manager::ScopedDeliveryEnvelope;
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Founder scopes an agent to channels [1, 3].
+        let invite = alice.invite_user_scoped(&[1, 3]).await?;
+        let uid = invite.id().expect("scoped invite carries a provisional uid");
+
+        // The delivered channel keys (mVE binding commitments) recorded in the
+        // invitee's server-side delivery slot.
+        let server = transport.server_state();
+        let slot = server
+            .lock()
+            .await
+            .get_delivery_slot(uid)
+            .expect("scoped invitee has a delivery slot");
+        let env: ScopedDeliveryEnvelope =
+            serde_json::from_slice(&slot).expect("scoped delivery envelope");
+
+        for ch in [1i64, 3i64] {
+            let delivered = env
+                .channels
+                .iter()
+                .find(|c| c.channel == ch)
+                .unwrap_or_else(|| panic!("channel {ch} must be delivered"))
+                .binding_commitment;
+
+            // The scoped invite must have committed a channel-grant `_retention`
+            // row keyed by the invitee's uid, committing the delivered key.
+            let rec: Option<crate::retention::RetentionRecord> = alice
+                .retention_table()
+                .select()
+                .where_eq("key", grant_row_key(uid, ch).as_str())
+                .last()
+                .await?;
+            let rec = rec.unwrap_or_else(|| panic!("grant row for channel {ch} must exist"));
+            let committed = KeyCommitment::from_bytes(&rec.value)
+                .expect("grant row value decodes to a KeyCommitment");
+            assert_eq!(
+                committed, delivered,
+                "channel {ch} grant commitment must equal the delivered binding commitment"
+            );
+        }
+        Ok(())
+    }
+
     /// A scoped member (no group key) must be able to WRITE into its channel,
     /// and both it AND a full member must decrypt that write. This is the
     /// agent-posts-a-reply path: the scoped writer derives the channel key from

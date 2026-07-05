@@ -57,9 +57,18 @@ pub struct ChannelDeliveryRequest {
 /// Client -> Server: invite a member with **scoped** read access — it receives
 /// only these channels' subtree keys, never the group key. Each entry is an mVE
 /// delivery of one channel's derived subtree key to the new member's update key.
+///
+/// `grant_proofs` runs parallel to `channels` (one per channel, same order): a
+/// §4.3 channel-grant derivation proof binding that channel's committed key to
+/// the group key. The server verifies each against the canonical group-key
+/// commitment before letting the InviteUser op's grant `_retention` rows land,
+/// so a client cannot persist a channel-grant record for a key it did not
+/// actually derive from the group key.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScopedInviteRequest {
     pub channels: Vec<ChannelDeliveryRequest>,
+    #[serde(default)]
+    pub grant_proofs: Vec<Vec<u8>>,
 }
 
 /// One channel's subtree key mVE-wrapped to a scoped member (server-side, after

@@ -235,6 +235,22 @@ pub trait SimpleLine2RuntimeProver: Default + Clone {
         input: DeleteKeysVerifyInput<'_>,
         proof: &[u8],
     ) -> Result<(), KeyManagerError>;
+
+    /// Prove that a channel key is the §4.3 structural derivation of the group
+    /// key (L2 read scoping). Carried through the runtime path so scoped-invite
+    /// / rekey re-grant sites can attach a derivation proof to each grant row
+    /// without depending on the concrete backend prover type.
+    fn prove_channel_grant_runtime(
+        &self,
+        input: ChannelGrantProofInput<'_, DefaultDerivation>,
+    ) -> Result<Vec<u8>, KeyManagerError>;
+
+    /// Verify a channel-grant derivation proof against public commitments.
+    fn verify_channel_grant_runtime(
+        &self,
+        input: ChannelGrantVerifyInput,
+        proof: &[u8],
+    ) -> Result<(), KeyManagerError>;
 }
 
 // =========================================================================
@@ -357,6 +373,23 @@ impl SimpleLine2RuntimeProver for NoProver {
         proof: &[u8],
     ) -> Result<(), KeyManagerError> {
         <Self as SimpleLine2Proofs<DefaultDerivation>>::verify_delete_keys(self, input, proof)
+            .map_err(|never| match never {})
+    }
+
+    fn prove_channel_grant_runtime(
+        &self,
+        input: ChannelGrantProofInput<'_, DefaultDerivation>,
+    ) -> Result<Vec<u8>, KeyManagerError> {
+        <Self as SimpleLine2Proofs<DefaultDerivation>>::prove_channel_grant(self, input)
+            .map_err(|never| match never {})
+    }
+
+    fn verify_channel_grant_runtime(
+        &self,
+        input: ChannelGrantVerifyInput,
+        proof: &[u8],
+    ) -> Result<(), KeyManagerError> {
+        <Self as SimpleLine2Proofs<DefaultDerivation>>::verify_channel_grant(self, input, proof)
             .map_err(|never| match never {})
     }
 }

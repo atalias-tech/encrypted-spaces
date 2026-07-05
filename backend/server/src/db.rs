@@ -45,8 +45,8 @@ use encrypted_spaces_key_manager::{
     GkDeliveryEnvelope, InviteRequest, KeyManagerError, PendingWritesView, RekeyRequest,
     ScopedChannelDelivery, ScopedDeliveryEnvelope, ScopedInviteRequest, SpaceKey,
 };
-use encrypted_spaces_retention::simple_line2::SimpleLine2SpaceKey;
-use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
+use encrypted_spaces_key_manager::channel_grant::parse_grant_row_key;
+use encrypted_spaces_retention::tree_space_key::{verify_channel_grant, TreeSpaceKey};
 use encrypted_spaces_storage_encoding::{action_storage_key, decode_action_value, hashstore_hash};
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -3215,7 +3215,101 @@ impl SpaceState {
             });
         }
 
-        // 3. Verify retention proofs (InviteUser writes no retention → none expected).
+        // 2b. Verify the channel-grant records this invite is about to persist
+        //     (L2 read scoping, §4.3). The guest already bound each grant row's
+        //     `{uid}` to the invitee and gated the op to a full-member signer;
+        //     here the server verifies the CRYPTO the guest cannot:
+        //       (1) derivation — each grant commitment is a real derivation of
+        //           the *canonical current group key* (rejects a client that
+        //           commits a channel key it never derived from the group key);
+        //       (2) binding — the delivered mVE `binding_commitment` equals the
+        //           persisted grant commitment (rejects a grant row that records
+        //           a different key than the one actually delivered).
+        //     Both run against pre-op state (an invite does not rekey), so the
+        //     canonical commitment read here is the group key the inviter used.
+        {
+            let group_commitment = {
+                let pre_state = self.retention_reader();
+                <TreeSpaceKey as SpaceKey>::canonical_group_key_commitment(&pre_state)
+                    .await
+                    .map_err(|_| {
+                        ServerError::Generic(
+                            "failed to load canonical group-key commitment for scoped invite"
+                                .to_string(),
+                        )
+                    })?
+            };
+
+            // Collect the grant rows carried in the signed InviteUser op, keyed
+            // by channel. `extract_retention_writes_from_change` strips the
+            // base64 layer, so each value is the raw `KeyCommitment` bytes.
+            let mut grant_by_channel: HashMap<i64, KeyCommitment> = HashMap::new();
+            for (key, value) in extract_retention_writes_from_change(insert_change) {
+                let Some((_uid, channel)) = parse_grant_row_key(&key) else {
+                    // Not a channel-grant row: an invite carries only grant rows
+                    // in `_retention`, so reject anything else outright.
+                    return Err(ServerError::Generic(format!(
+                        "scoped invite carries an unexpected _retention row: {key}"
+                    )));
+                };
+                let commitment = KeyCommitment::from_bytes(&value).ok_or_else(|| {
+                    ServerError::Generic("channel-grant row has a malformed commitment".to_string())
+                })?;
+                if grant_by_channel.insert(channel, commitment).is_some() {
+                    return Err(ServerError::Generic(format!(
+                        "scoped invite has duplicate channel-grant rows for channel {channel}"
+                    )));
+                }
+            }
+
+            // Exactly one grant row per delivered channel, and one proof each —
+            // no un-proven grant rows land, no delivered channel goes ungranted.
+            if grant_by_channel.len() != request.channels.len()
+                || request.grant_proofs.len() != request.channels.len()
+            {
+                return Err(ServerError::Generic(format!(
+                    "scoped invite grant/delivery/proof mismatch: {} grant rows, \
+                     {} deliveries, {} proofs",
+                    grant_by_channel.len(),
+                    request.channels.len(),
+                    request.grant_proofs.len()
+                )));
+            }
+
+            for (ch_req, grant_proof) in request.channels.iter().zip(request.grant_proofs.iter()) {
+                let grant_commitment = grant_by_channel.get(&ch_req.channel).ok_or_else(|| {
+                    ServerError::Generic(format!(
+                        "delivered channel {} has no matching channel-grant row",
+                        ch_req.channel
+                    ))
+                })?;
+                // (2) binding: delivered key ≡ persisted grant record.
+                if *grant_commitment != ch_req.commitment {
+                    return Err(ServerError::Generic(format!(
+                        "channel {} grant commitment does not equal the delivered \
+                         binding commitment",
+                        ch_req.channel
+                    )));
+                }
+                // (1) derivation: grant commitment is a §4.3 derivation of the
+                //     canonical group key.
+                verify_channel_grant(
+                    ch_req.channel,
+                    group_commitment,
+                    *grant_commitment,
+                    grant_proof,
+                )
+                .map_err(|_| {
+                    ServerError::Generic(format!(
+                        "channel {} grant derivation proof verification failed",
+                        ch_req.channel
+                    ))
+                })?;
+            }
+        }
+
+        // 3. Verify retention proofs (InviteUser writes no *chain* retention →
+        //    none expected; grant rows are verified above, not here).
         self.verify_retention_proofs_from_change(
             insert_change.entry.message.op_type,
             retention_proofs,
@@ -4149,7 +4243,7 @@ mod tests {
     use encrypted_spaces_changelog_core::changelog::ROOT_TREE_PATH;
     use encrypted_spaces_crypto::signature::{Ed25519Signature, SignatureKeyPair};
     use encrypted_spaces_key_manager::{CollectingOperationBuilder, SimpleKeyId};
-    use encrypted_spaces_retention::simple_line2::StarkProver;
+    use encrypted_spaces_retention::simple_line2::{SimpleLine2SpaceKey, StarkProver};
 
     // --- Async state tests ---
     // Use unique byte patterns per test to avoid SPACES map collisions when tests run in parallel.

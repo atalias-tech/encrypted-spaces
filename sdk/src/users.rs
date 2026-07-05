@@ -361,19 +361,45 @@ impl Space {
         use encrypted_spaces_crypto::key_derivation::{
             DerivationKoalaBearPoseidon2_16, KeyDerivation,
         };
+        use encrypted_spaces_key_manager::channel_grant::grant_row_key;
         use encrypted_spaces_key_manager::{prove_channel_delivery, ScopedInviteRequest};
 
         // 1. Provisional keypairs for the new member.
         let new_user = UserWithSecrets::provisional();
         let new_pk = new_user.update_key_pair.public().clone();
 
-        // 2. Derive each channel's subtree key from our group key and build the
-        //    per-channel mVE delivery to the new member.
-        let scoped_request = {
+        // 2. Predict the invitee's uid. The InviteUser op allocates it from the
+        //    `_users` next-id counter, and the FF guest (Task 3) binds each
+        //    grant row's `{uid}` to that allocated id — but we sign the
+        //    grant-row keys BEFORE the server assigns the id, so we must
+        //    predict it. Absent removals the counter equals max(existing) + 1
+        //    (matching the guest's `read_next_id` default of 1 for an empty
+        //    table). A stale guess fails closed: the guest rejects the whole
+        //    invite. The fully-robust source is the authoritative
+        //    `_users` next-id counter, which has no client read path today
+        //    (see the L2 Part B Task 4 report).
+        let invitee_uid = {
+            let users: Vec<UserRecord> = self.users().select().all().await?;
+            users
+                .iter()
+                .filter_map(|u| u.id)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(1)
+        };
+
+        // 3. Derive each channel's subtree key from our group key and build, per
+        //    channel: the mVE delivery, a §4.3 grant *derivation* proof, and the
+        //    grant `_retention` write. The grant commitment == the mVE
+        //    `binding_commitment` == `commit(subtree key)`, so the committed
+        //    grant record is exactly the delivered key.
+        let (scoped_request, grant_writes) = {
             let km = self.key_manager.lock().await;
             let tree = km.space_key();
             let derivation = DerivationKoalaBearPoseidon2_16::default();
             let mut reqs = Vec::with_capacity(channels.len());
+            let mut grant_proofs = Vec::with_capacity(channels.len());
+            let mut grant_writes: Vec<(String, Vec<u8>)> = Vec::with_capacity(channels.len());
             for &ch in channels {
                 let subtree = tree.channel_subtree_key(ch).ok_or_else(|| {
                     SdkError::ValidationError(
@@ -381,19 +407,37 @@ impl Space {
                     )
                 })?;
                 let commitment = derivation.commit(&subtree);
+                let grant_proof = tree.prove_channel_grant(ch).ok_or_else(|| {
+                    SdkError::ValidationError(
+                        "only a full member can issue a scoped invite".into(),
+                    )
+                })?;
                 reqs.push(prove_channel_delivery(
                     ch,
                     commitment,
                     &subtree,
                     std::slice::from_ref(&new_pk),
                 ));
+                grant_proofs.push(grant_proof);
+                // Retention-value convention (mirrors `save_commitment`): store
+                // the raw commitment bytes; `append_retention_to_changelog`
+                // base64-encodes once, so a reader recovers it with
+                // `decode_grant_value` / `KeyCommitment::from_bytes`.
+                grant_writes.push((grant_row_key(invitee_uid, ch), commitment.as_bytes().to_vec()));
             }
-            ScopedInviteRequest { channels: reqs }
+            (
+                ScopedInviteRequest {
+                    channels: reqs,
+                    grant_proofs,
+                },
+                grant_writes,
+            )
         };
 
-        // 3. Insert the provisional _users record (InviteUser op, no retention
-        //    writes — a scoped invite delivers no group key). _users is plaintext,
-        //    so encrypt_query_fields is a no-op even without a group key.
+        // 4. Insert the provisional _users record + the grant `_retention` rows
+        //    in one signed InviteUser op (the guest binds each grant `{uid}` to
+        //    the invitee's allocated row id). _users is plaintext, so
+        //    encrypt_query_fields is a no-op even without a group key.
         let mut pending_record = new_user.as_record();
         pending_record.status = UserStatus::ScopedProvisional;
         let mut insert_builder = self.users().insert(&pending_record);
@@ -402,11 +446,14 @@ impl Space {
         let change = {
             use crate::changelog::ChangeBuilder;
             ChangeBuilder::new(&mut insert_builder.query, std::sync::Arc::new(self.clone()))
-                .build_invite_user(&[])
+                .build_invite_user(&grant_writes)
                 .await?
         };
 
-        // 4. Submit via the scoped path (deposits a ScopedDeliveryEnvelope).
+        // 5. Submit via the scoped path (server verifies each grant's
+        //    derivation proof + binding, then deposits a ScopedDeliveryEnvelope).
+        //    Grant STARK proofs ride in the request's `grant_proofs`; InviteUser
+        //    carries no chain-retention proofs, so `retention_proofs` stays empty.
         let change_response = self
             .transport
             .scoped_add_member(scoped_request, &change, vec![])
