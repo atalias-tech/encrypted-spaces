@@ -361,19 +361,45 @@ impl Space {
         use encrypted_spaces_crypto::key_derivation::{
             DerivationKoalaBearPoseidon2_16, KeyDerivation,
         };
+        use encrypted_spaces_key_manager::channel_grant::grant_row_key;
         use encrypted_spaces_key_manager::{prove_channel_delivery, ScopedInviteRequest};
 
         // 1. Provisional keypairs for the new member.
         let new_user = UserWithSecrets::provisional();
         let new_pk = new_user.update_key_pair.public().clone();
 
-        // 2. Derive each channel's subtree key from our group key and build the
-        //    per-channel mVE delivery to the new member.
-        let scoped_request = {
+        // 2. Predict the invitee's uid. The InviteUser op allocates it from the
+        //    `_users` next-id counter, and the FF guest (Task 3) binds each
+        //    grant row's `{uid}` to that allocated id — but we sign the
+        //    grant-row keys BEFORE the server assigns the id, so we must
+        //    predict it. Absent removals the counter equals max(existing) + 1
+        //    (matching the guest's `read_next_id` default of 1 for an empty
+        //    table). A stale guess fails closed: the guest rejects the whole
+        //    invite. The fully-robust source is the authoritative
+        //    `_users` next-id counter, which has no client read path today
+        //    (see the L2 Part B Task 4 report).
+        let invitee_uid = {
+            let users: Vec<UserRecord> = self.users().select().all().await?;
+            users
+                .iter()
+                .filter_map(|u| u.id)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(1)
+        };
+
+        // 3. Derive each channel's subtree key from our group key and build, per
+        //    channel: the mVE delivery, a §4.3 grant *derivation* proof, and the
+        //    grant `_retention` write. The grant commitment == the mVE
+        //    `binding_commitment` == `commit(subtree key)`, so the committed
+        //    grant record is exactly the delivered key.
+        let (scoped_request, grant_writes) = {
             let km = self.key_manager.lock().await;
             let tree = km.space_key();
             let derivation = DerivationKoalaBearPoseidon2_16::default();
             let mut reqs = Vec::with_capacity(channels.len());
+            let mut grant_proofs = Vec::with_capacity(channels.len());
+            let mut grant_writes: Vec<(String, Vec<u8>)> = Vec::with_capacity(channels.len());
             for &ch in channels {
                 let subtree = tree.channel_subtree_key(ch).ok_or_else(|| {
                     SdkError::ValidationError(
@@ -381,19 +407,37 @@ impl Space {
                     )
                 })?;
                 let commitment = derivation.commit(&subtree);
+                let grant_proof = tree.prove_channel_grant(ch).ok_or_else(|| {
+                    SdkError::ValidationError(
+                        "only a full member can issue a scoped invite".into(),
+                    )
+                })?;
                 reqs.push(prove_channel_delivery(
                     ch,
                     commitment,
                     &subtree,
                     std::slice::from_ref(&new_pk),
                 ));
+                grant_proofs.push(grant_proof);
+                // Retention-value convention (mirrors `save_commitment`): store
+                // the raw commitment bytes; `append_retention_to_changelog`
+                // base64-encodes once, so a reader recovers it with
+                // `decode_grant_value` / `KeyCommitment::from_bytes`.
+                grant_writes.push((grant_row_key(invitee_uid, ch), commitment.as_bytes().to_vec()));
             }
-            ScopedInviteRequest { channels: reqs }
+            (
+                ScopedInviteRequest {
+                    channels: reqs,
+                    grant_proofs,
+                },
+                grant_writes,
+            )
         };
 
-        // 3. Insert the provisional _users record (InviteUser op, no retention
-        //    writes — a scoped invite delivers no group key). _users is plaintext,
-        //    so encrypt_query_fields is a no-op even without a group key.
+        // 4. Insert the provisional _users record + the grant `_retention` rows
+        //    in one signed InviteUser op (the guest binds each grant `{uid}` to
+        //    the invitee's allocated row id). _users is plaintext, so
+        //    encrypt_query_fields is a no-op even without a group key.
         let mut pending_record = new_user.as_record();
         pending_record.status = UserStatus::ScopedProvisional;
         let mut insert_builder = self.users().insert(&pending_record);
@@ -402,11 +446,14 @@ impl Space {
         let change = {
             use crate::changelog::ChangeBuilder;
             ChangeBuilder::new(&mut insert_builder.query, std::sync::Arc::new(self.clone()))
-                .build_invite_user(&[])
+                .build_invite_user(&grant_writes)
                 .await?
         };
 
-        // 4. Submit via the scoped path (deposits a ScopedDeliveryEnvelope).
+        // 5. Submit via the scoped path (server verifies each grant's
+        //    derivation proof + binding, then deposits a ScopedDeliveryEnvelope).
+        //    Grant STARK proofs ride in the request's `grant_proofs`; InviteUser
+        //    carries no chain-retention proofs, so `retention_proofs` stays empty.
         let change_response = self
             .transport
             .scoped_add_member(scoped_request, &change, vec![])
@@ -475,15 +522,29 @@ impl Space {
             .map(|u| u.update_key.clone())
             .collect();
 
-        // 4. Generate the rekey request for the non-scoped recipients
+        // 4. Generate the rekey request for the non-scoped recipients, keeping
+        //    the freshly generated group key so we can refresh surviving scoped
+        //    members' channel keys against the NEW epoch (L2 Part B).
         let mut rekey_builder = self.retention_builder();
-        let delete_request = self
+        let (mut delete_request, new_group_key) = self
             .key_manager()
-            .rekey(&recipient_pks, &mut rekey_builder)
+            .rekey_with_group_key(&recipient_pks, &mut rekey_builder)
             .await?;
         let rekey_output = rekey_builder.finalize();
-        let rekey_retention_writes = rekey_output.writes;
+        let mut rekey_retention_writes = rekey_output.writes;
         let rekey_proofs = rekey_output.proofs;
+
+        // 4b. L2 Part B: re-derive + re-deliver each surviving scoped member's
+        //     channel keys against the new group key. The refreshed grant rows
+        //     ride in the signed RemoveUser op (guest-validated); the deliveries
+        //     + proofs ride in the rekey request (server-verified, then
+        //     re-deposited as fresh ScopedDeliveryEnvelopes). The removed user
+        //     is excluded — it is not re-granted and its slot is still cleared.
+        let (scoped_regrants, grant_writes) = self
+            .build_scoped_regrants(&new_group_key, Some(user_id))
+            .await?;
+        delete_request.scoped_regrants = scoped_regrants;
+        rekey_retention_writes.extend(grant_writes);
         // 5. Build _key_history insert for the removed user's current auth key.
         //    Encode the auth key the same way as RefreshKeys (base64 of JSON-serialized vk).
         let target_auth_key_b64 = {
@@ -570,6 +631,122 @@ impl Space {
             .await?;
 
         Ok(())
+    }
+
+    /// Build the L2 Part B rekey re-delivery bundle: for each SURVIVING scoped
+    /// member, re-derive every channel it was ALREADY granted against the NEW
+    /// group key and produce the mVE delivery + §4.3 grant proof + refreshed
+    /// grant `_retention` row.
+    ///
+    /// Returns `(scoped_regrants, grant_writes)`:
+    /// - `scoped_regrants` rides in the `RekeyRequest` (per-member deliveries +
+    ///   proofs), so the server can verify + re-deposit each scoped member's
+    ///   `ScopedDeliveryEnvelope`.
+    /// - `grant_writes` are appended to the signed Rekey/RemoveUser op's
+    ///   `_retention` writes (the guest binds each grant `{uid}` to a scoped
+    ///   member and requires a full-member signer).
+    ///
+    /// Scope is REFRESHED, never expanded: channels come from the member's
+    /// existing grant rows (read pre-rekey). `removed_uid` (removal path) is
+    /// excluded so the member being removed is never re-granted (the guest also
+    /// rejects a grant for the removed uid).
+    ///
+    /// Mirrors the scoped-invite triple-build in [`Self::invite_user_scoped`],
+    /// but derives against the freshly generated (not-yet-installed) group key.
+    pub(crate) async fn build_scoped_regrants(
+        &self,
+        new_group_key: &encrypted_spaces_crypto::KeyMaterial,
+        removed_uid: Option<i64>,
+    ) -> Result<
+        (
+            Vec<encrypted_spaces_key_manager::ScopedRegrant>,
+            Vec<(String, Vec<u8>)>,
+        ),
+        SdkError,
+    > {
+        use encrypted_spaces_crypto::key_derivation::{
+            DerivationKoalaBearPoseidon2_16, KeyDerivation,
+        };
+        use encrypted_spaces_key_manager::channel_grant::{grant_row_key, parse_grant_row_key};
+        use encrypted_spaces_key_manager::{prove_channel_delivery, ChannelRegrant, ScopedRegrant};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // 1. Surviving scoped members (status Scoped/ScopedProvisional), minus
+        //    the removed uid. Preserve their current update key for delivery.
+        let users: Vec<UserRecord> = self.users().select().all().await?;
+        let mut scoped: BTreeMap<i64, SpacePublicKey> = BTreeMap::new();
+        for u in &users {
+            let Some(uid) = u.id else { continue };
+            if Some(uid) == removed_uid {
+                continue;
+            }
+            if u.status.is_scoped() {
+                scoped.insert(uid, u.update_key.clone());
+            }
+        }
+        if scoped.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // 2. Enumerate each scoped member's already-granted channels from the
+        //    EXISTING grant rows. `OperationReader::get` is exact-key only, so
+        //    (mirroring `warm_retention_cache`) we scan all `_retention` rows
+        //    and prefix-filter with `parse_grant_row_key`. Dedup by (uid, ch):
+        //    a grant key may have multiple rows (one per past rekey), but we
+        //    only need the SET of channels each member holds.
+        let all_retention: Vec<crate::retention::RetentionRecord> =
+            self.retention_table().select().all().await?;
+        let mut channels_by_uid: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+        for rec in &all_retention {
+            if let Some((uid, channel)) = parse_grant_row_key(&rec.key) {
+                if scoped.contains_key(&uid) {
+                    channels_by_uid.entry(uid).or_default().insert(channel);
+                }
+            }
+        }
+
+        // 3. Per (scoped member, granted channel): derive the channel subtree
+        //    key from the NEW group key, then build the delivery + grant proof
+        //    + grant row. The grant commitment == the mVE `binding_commitment`
+        //    == commit(subtree), so the persisted grant record is exactly the
+        //    delivered key (one key, one commitment, one proof).
+        let derivation = DerivationKoalaBearPoseidon2_16::default();
+        let km = self.key_manager.lock().await;
+        let tree = km.space_key();
+        let mut regrants = Vec::new();
+        let mut grant_writes: Vec<(String, Vec<u8>)> = Vec::new();
+        for (uid, pk) in &scoped {
+            let Some(channels) = channels_by_uid.get(uid) else {
+                continue; // scoped member with no grants: nothing to refresh
+            };
+            let mut ch_regrants = Vec::with_capacity(channels.len());
+            for &ch in channels {
+                let (subtree, grant_proof) = tree
+                    .channel_grant_for_group_key(new_group_key, ch)
+                    .ok_or_else(|| {
+                        SdkError::ValidationError(
+                            "failed to build channel-grant proof for rekey re-delivery".into(),
+                        )
+                    })?;
+                let commitment = derivation.commit(&subtree);
+                let delivery =
+                    prove_channel_delivery(ch, commitment, &subtree, std::slice::from_ref(pk));
+                ch_regrants.push(ChannelRegrant {
+                    delivery,
+                    grant_proof,
+                });
+                // Raw commitment bytes (mirrors `invite_user_scoped` /
+                // `save_commitment`): `append_retention_to_changelog`
+                // base64-encodes once, so the on-chain value round-trips via
+                // `KeyCommitment::from_bytes`.
+                grant_writes.push((grant_row_key(*uid, ch), commitment.as_bytes().to_vec()));
+            }
+            regrants.push(ScopedRegrant {
+                uid: *uid,
+                channels: ch_regrants,
+            });
+        }
+        Ok((regrants, grant_writes))
     }
 
     /// Replace this member's update and auth key pairs with freshly generated versions.

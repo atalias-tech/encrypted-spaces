@@ -386,6 +386,63 @@ mod tests {
         Ok(())
     }
 
+    /// L2 Part B (Task 4): a scoped invite must commit a `_retention`
+    /// channel-grant record per granted channel. Each record commits the SAME
+    /// `KeyCommitment` the mVE delivery binds — so the persisted grant ≡ the
+    /// delivered channel key — and the server only lets the rows land after
+    /// verifying each grant's derivation proof, so their presence is proof the
+    /// server accepted them.
+    #[tokio::test]
+    async fn scoped_invite_writes_grant_records() -> Result<()> {
+        use encrypted_spaces_crypto::KeyCommitment;
+        use encrypted_spaces_key_manager::channel_grant::grant_row_key;
+        use encrypted_spaces_key_manager::ScopedDeliveryEnvelope;
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Founder scopes an agent to channels [1, 3].
+        let invite = alice.invite_user_scoped(&[1, 3]).await?;
+        let uid = invite.id().expect("scoped invite carries a provisional uid");
+
+        // The delivered channel keys (mVE binding commitments) recorded in the
+        // invitee's server-side delivery slot.
+        let server = transport.server_state();
+        let slot = server
+            .lock()
+            .await
+            .get_delivery_slot(uid)
+            .expect("scoped invitee has a delivery slot");
+        let env: ScopedDeliveryEnvelope =
+            serde_json::from_slice(&slot).expect("scoped delivery envelope");
+
+        for ch in [1i64, 3i64] {
+            let delivered = env
+                .channels
+                .iter()
+                .find(|c| c.channel == ch)
+                .unwrap_or_else(|| panic!("channel {ch} must be delivered"))
+                .binding_commitment;
+
+            // The scoped invite must have committed a channel-grant `_retention`
+            // row keyed by the invitee's uid, committing the delivered key.
+            let rec: Option<crate::retention::RetentionRecord> = alice
+                .retention_table()
+                .select()
+                .where_eq("key", grant_row_key(uid, ch).as_str())
+                .last()
+                .await?;
+            let rec = rec.unwrap_or_else(|| panic!("grant row for channel {ch} must exist"));
+            let committed = KeyCommitment::from_bytes(&rec.value)
+                .expect("grant row value decodes to a KeyCommitment");
+            assert_eq!(
+                committed, delivered,
+                "channel {ch} grant commitment must equal the delivered binding commitment"
+            );
+        }
+        Ok(())
+    }
+
     /// A scoped member (no group key) must be able to WRITE into its channel,
     /// and both it AND a full member must decrypt that write. This is the
     /// agent-posts-a-reply path: the scoped writer derives the channel key from
@@ -913,6 +970,632 @@ mod tests {
         );
         assert_eq!(seen_by_bob[0].body, "post-rekey secret");
 
+        Ok(())
+    }
+
+    /// L2 Part B CROWN JEWEL: a scoped member keeps reading NEW messages in its
+    /// channel across a rekey. A rekey rotates the group key, so every channel's
+    /// subtree key (`channel_root(group_key, channel)`) changes; without
+    /// re-delivery the scoped member's installed key goes stale and it can no
+    /// longer decrypt post-rekey rows. The rekey path (here a member removal)
+    /// must re-derive + re-deliver each surviving scoped member's channel key
+    /// against the NEW epoch, and `refresh_scoped_keys` re-installs it.
+    #[tokio::test]
+    async fn scoped_member_reads_new_message_after_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // A scoped agent joins channel 1 (holds no group key).
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Force a REAL rekey (new group-key epoch): add + remove a throwaway
+        // full member. Capture its uid before `join` consumes the invite.
+        let throwaway = alice.invite_user().await?;
+        let throwaway_uid = throwaway.id().expect("full invite carries a uid");
+        let _tj = crate::Space::join(transport.clone(), throwaway, schema()).await?;
+        // Converge alice's `_users` cache on both members' post-join rotations
+        // before building the removal's rekey (same reasoning as the leak tests).
+        alice.recover_via_fast_forward().await?;
+        alice.remove_user(throwaway_uid).await?; // triggers the group rekey
+
+        // Alice posts a NEW ch1 message under the new epoch.
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "post-rekey ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        // The scoped agent re-fetches its refreshed channel key and reads it.
+        agent.refresh_scoped_keys().await?; // Task 6 auto-invokes; here explicit.
+        let rows: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "post-rekey ch1"),
+            "scoped agent must read a NEW ch1 message after a rekey"
+        );
+        Ok(())
+    }
+
+    /// L2 Part B, standalone-rekey path: the crown-jewel test above drives the
+    /// member-removal rekey (`handle_remove_member`); a STANDALONE rekey
+    /// (`Space::rekey` → `handle_retention`) is the other path that rotates the
+    /// group key, and a scoped member must keep reading its channel across it
+    /// too. Confirms the re-delivery works on both paths.
+    #[tokio::test]
+    async fn scoped_member_reads_new_message_after_standalone_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Converge alice's `_users` cache on the agent's post-join rotation, then
+        // do a STANDALONE rekey (no removal) — a fresh group-key epoch.
+        alice.recover_via_fast_forward().await?;
+        alice.rekey().await?;
+
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "post-standalone-rekey ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        agent.refresh_scoped_keys().await?;
+        let rows: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "post-standalone-rekey ch1"),
+            "scoped agent must read a NEW ch1 message after a standalone rekey"
+        );
+        Ok(())
+    }
+
+    /// L2 Part B defect fix: a scoped `refresh_scoped_keys` must SKIP a delivery
+    /// envelope it has already consumed, not re-process it.
+    ///
+    /// The server never clears a delivery slot, so the runtime's periodic
+    /// refresh re-fetches the SAME (join) envelope on every rescan. That
+    /// envelope was wrapped to the invitee's PROVISIONAL update key and
+    /// installed at join — but `join` then rotates the update keypair, so
+    /// re-running the mVE unwrap on it can never succeed again and only logs
+    /// "failed to decrypt against anchored commitment; skipping" every tick.
+    /// A redundant refresh with NO new delivery must be a clean no-op: it must
+    /// NOT re-invoke the install path, and it must leave the channel key
+    /// installed (the agent keeps reading).
+    #[tokio::test]
+    async fn refresh_skips_already_consumed_delivery() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "legit ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Join installs the scoped channel key exactly once.
+        assert_eq!(
+            agent.scoped_install_call_count(),
+            1,
+            "join installs the scoped channel key once"
+        );
+
+        // Sanity: the agent reads its channel with the anchored key.
+        let before: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(before.iter().any(|m| m.body == "legit ch1"));
+
+        // No rekey has occurred, so the slot still holds the SAME join envelope.
+        // A redundant refresh must be deduped — NOT re-processed (which would
+        // re-run the now-doomed mVE unwrap and WARN-spam).
+        agent.refresh_scoped_keys().await?;
+        assert_eq!(
+            agent.scoped_install_call_count(),
+            1,
+            "redundant refresh of an unchanged delivery must be deduped, not re-processed"
+        );
+
+        // The channel key remains installed — the agent can still read.
+        let after: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            after.iter().any(|m| m.body == "legit ch1"),
+            "channel key must remain installed after the redundant refresh"
+        );
+        Ok(())
+    }
+
+    /// L2 Part B security: `refresh_scoped_keys` must verify each delivered
+    /// channel key against its ANCHORED on-chain grant commitment, not the
+    /// server-supplied envelope commitment. A malicious server that deposits a
+    /// wrong-but-self-consistent `(ciphertext, binding_commitment)` pair (the
+    /// old `decrypt_delivered_key`-only check would install it, since
+    /// `commit(key) == binding_commitment` holds) must be REJECTED: the agent
+    /// keeps its correct, anchored key and can still read its channel.
+    #[tokio::test]
+    async fn refresh_rejects_server_substituted_channel_key() -> Result<()> {
+        use encrypted_spaces_crypto::key_derivation::{
+            DerivationKoalaBearPoseidon2_16, KeyDerivation,
+        };
+        use encrypted_spaces_crypto::KeyMaterial;
+        use encrypted_spaces_key_manager::{
+            prove_channel_delivery, verify_channel_delivery, ScopedChannelDelivery,
+            ScopedDeliveryEnvelope,
+        };
+
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "legit ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent_uid = invite.id().expect("scoped invite carries a uid");
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Sanity: the agent reads its channel with the correct, anchored key.
+        let before: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(before.iter().any(|m| m.body == "legit ch1"));
+
+        // The agent's CURRENT update key (post-join rotation), from alice's view.
+        alice.recover_via_fast_forward().await?;
+        let agent_pk = alice
+            .users()
+            .select()
+            .all()
+            .await?
+            .into_iter()
+            .find(|u: &crate::users::UserRecord| u.id == Some(agent_uid))
+            .expect("agent is a member")
+            .update_key;
+
+        // Malicious server: deposit a self-consistent envelope for a WRONG key
+        // (commit(wrong) == its own binding_commitment, so the naive check would
+        // accept it), wrapped to the agent's real update key.
+        let wrong_key = KeyMaterial::digest(b"attacker-substituted-channel-key");
+        let wrong_commitment = DerivationKoalaBearPoseidon2_16::default().commit(&wrong_key);
+        let req =
+            prove_channel_delivery(1, wrong_commitment, &wrong_key, std::slice::from_ref(&agent_pk));
+        let cts = verify_channel_delivery(std::slice::from_ref(&agent_pk), &req)
+            .expect("bogus delivery is a well-formed mVE");
+        let bogus = ScopedDeliveryEnvelope {
+            channels: vec![ScopedChannelDelivery {
+                channel: 1,
+                binding_commitment: wrong_commitment,
+                ciphertext: cts.get(0).unwrap().clone(),
+            }],
+        };
+        transport
+            .server_state()
+            .lock()
+            .await
+            .key_delivery_slots
+            .put(agent_uid, serde_json::to_vec(&bogus).unwrap());
+
+        // The agent refreshes. The bogus delivery's commitment != the anchored
+        // grant commitment, so it must be SKIPPED (not installed). The agent
+        // keeps its correct key and still reads its channel. Under the old
+        // envelope-commitment check, the wrong key would be installed and this
+        // read would return zero rows.
+        agent.refresh_scoped_keys().await?;
+        let after: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            after.iter().any(|m| m.body == "legit ch1"),
+            "server-substituted channel key must be rejected; agent keeps its anchored key"
+        );
+        Ok(())
+    }
+
+    /// L2 Part B security (Task 7, Step 1 + the carry-forward server-REJECTION
+    /// gap from the Task 4/5 reviews): a scoped member cannot have an un-granted
+    /// channel delivered to it across a rekey — the server's PRE-EXISTENCE /
+    /// no-scope-expansion guard rejects any re-grant for a channel the member
+    /// was not ALREADY granted.
+    ///
+    /// The GUEST-level forgery — a `Scoped` member cannot even SIGN a
+    /// channel-grant `_retention` row — is already locked in by Task 3 in
+    /// `ffproof/changelog_core`:
+    /// `rekey_op::test_scoped_signer_rekey_self_grant_rejected`,
+    /// `invite_user_op::test_scoped_signer_invite_with_grant_rejected`,
+    /// `remove_user_op::test_scoped_signer_remove_user_with_grant_rejected`,
+    /// plus the canonical-form and multi-row-decoy rejections. This test adds
+    /// the SDK-level defense-in-depth over the real submission path: even a
+    /// FULL-member-signed rekey (the only signer the guest accepts for grant
+    /// rows) that bundles a re-grant for a channel the scoped member never held
+    /// is rejected by the server BEFORE any delivery slot is written — so a
+    /// scoped member's scope can be REFRESHED across a rekey but never EXPANDED.
+    ///
+    /// TEETH: the forged channel's derivation, grant/delivery binding, and mVE
+    /// are all well-formed (they are built with the same primitives an honest
+    /// re-grant uses), and the same construction MINUS the forged channel is a
+    /// valid rekey that SUCCEEDS (see `scoped_member_reads_new_message_after_
+    /// standalone_rekey`). The ONLY defect is that channel 2 has no pre-existing
+    /// grant row for this member, and the error is asserted to name the
+    /// "expands scope" guard — so the rejection is that guard, not an incidental
+    /// failure. Delete the pre-existence check and this rekey would be accepted.
+    #[tokio::test]
+    async fn scoped_member_cannot_forge_grant() -> Result<()> {
+        use crate::users::UserRecord;
+        use encrypted_spaces_crypto::key_derivation::{
+            DerivationKoalaBearPoseidon2_16, KeyDerivation,
+        };
+        use encrypted_spaces_key_manager::channel_grant::grant_row_key;
+        use encrypted_spaces_key_manager::{prove_channel_delivery, ChannelRegrant};
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // A scoped agent granted channel 1 ONLY.
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent_uid = invite.id().expect("scoped invite carries a uid");
+        let _agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+
+        // Converge alice's `_users` view on the agent's post-join key rotation so
+        // the honest channel-1 re-grant delivery is wrapped to the agent's
+        // CURRENT update key (otherwise the rekey would fail on channel 1's mVE
+        // check, not the scope-expansion guard this test targets).
+        alice.recover_via_fast_forward().await?;
+
+        // Build a standalone rekey exactly like `Space::rekey`, keeping the
+        // freshly generated group key so we can forge an extra channel re-grant.
+        let all_users: Vec<UserRecord> = alice.users().select().all().await?;
+        let remaining_pks: Vec<crate::key_manager::SpacePublicKey> = all_users
+            .iter()
+            .filter(|u| !u.status.is_scoped())
+            .map(|u| u.update_key.clone())
+            .collect();
+
+        let mut rekey_builder = alice.retention_builder();
+        let (mut rekey_request, new_group_key) = alice
+            .key_manager()
+            .rekey_with_group_key(&remaining_pks, &mut rekey_builder)
+            .await?;
+        let rekey_output = rekey_builder.finalize();
+        let mut retention_writes = rekey_output.writes;
+        let retention_proofs = rekey_output.proofs;
+
+        // Honest re-grants: refresh the agent's channel 1 against the new epoch.
+        let (mut scoped_regrants, mut grant_writes) =
+            alice.build_scoped_regrants(&new_group_key, None).await?;
+
+        // ATTACK: forge an extra re-grant for channel 2 — a channel the agent
+        // was NEVER granted — plus a matching channel-grant `_retention` row,
+        // exactly as an honest re-grant would look. Everything (derivation,
+        // binding, delivery mVE) is well-formed; the ONLY thing wrong is that
+        // channel 2 has no pre-existing grant row for this member.
+        const UNGRANTED_CH: i64 = 2;
+        let agent_pk = all_users
+            .iter()
+            .find(|u| u.id == Some(agent_uid))
+            .expect("agent is a member")
+            .update_key
+            .clone();
+        let derivation = DerivationKoalaBearPoseidon2_16::default();
+        let (subtree, grant_proof) = {
+            let km = alice.key_manager.lock().await;
+            km.space_key()
+                .channel_grant_for_group_key(&new_group_key, UNGRANTED_CH)
+                .expect("derive forged channel subtree key")
+        };
+        let commitment = derivation.commit(&subtree);
+        let delivery = prove_channel_delivery(
+            UNGRANTED_CH,
+            commitment,
+            &subtree,
+            std::slice::from_ref(&agent_pk),
+        );
+        let victim = scoped_regrants
+            .iter_mut()
+            .find(|r| r.uid == agent_uid)
+            .expect("agent has an honest re-grant to piggyback on");
+        victim.channels.push(ChannelRegrant {
+            delivery,
+            grant_proof,
+        });
+        grant_writes.push((
+            grant_row_key(agent_uid, UNGRANTED_CH),
+            commitment.as_bytes().to_vec(),
+        ));
+
+        rekey_request.scoped_regrants = scoped_regrants;
+        retention_writes.extend(grant_writes);
+
+        let change =
+            crate::changelog::ChangeBuilder::retention_only(std::sync::Arc::new(alice.clone()))
+                .build_rekey(&retention_writes)
+                .await?;
+
+        let result = alice
+            .transport
+            .submit_retention(&change, retention_proofs, Some(rekey_request))
+            .await;
+
+        // The server must REJECT the whole rekey on the scope-expansion guard.
+        let err = result.expect_err(
+            "server must reject a rekey that expands a scoped member's scope to an \
+             un-granted channel",
+        );
+        assert!(
+            err.to_string().contains("expands scope"),
+            "rejection must come from the no-scope-expansion guard, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// L2 Part B (Task 7, Step 2): multi-channel + multi-member retention and
+    /// isolation across a rekey. Agent A is scoped to {1, 3} and must keep
+    /// reading BOTH channels' NEW messages after a rekey; Agent B is scoped to
+    /// {2} and must read ONLY channel 2. Neither may read the other's channel —
+    /// the rekey re-delivers each surviving scoped member exactly its own
+    /// subtree keys, no more.
+    ///
+    /// TEETH: the "reads a NEW message" asserts fail if re-delivery breaks (a
+    /// stale channel key can't decrypt post-rekey rows); the cross-member
+    /// isolation asserts (`all channel ∈ scope`, `!contains the other's body`)
+    /// fail if scoping breaks (e.g. a member wrongly held the group key).
+    #[tokio::test]
+    async fn multi_channel_and_multi_member() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Agent A → channels {1, 3}; Agent B → channel {2}.
+        let invite_a = alice.invite_user_scoped(&[1, 3]).await?;
+        let agent_a = crate::Space::join(transport.clone(), invite_a, schema()).await?;
+        agent_a.register_table_schema(msgs_schema()?);
+        let invite_b = alice.invite_user_scoped(&[2]).await?;
+        let agent_b = crate::Space::join(transport.clone(), invite_b, schema()).await?;
+        agent_b.register_table_schema(msgs_schema()?);
+
+        // Baseline BEFORE the rekey: each agent sees exactly its own channels.
+        for (ch, body) in [(1i64, "a-pre-1"), (2, "b-pre-2"), (3, "a-pre-3")] {
+            alice
+                .table::<Msg>("msgs")
+                .insert(&Msg {
+                    id: None,
+                    channel_id: ch,
+                    body: body.into(),
+                })
+                .execute()
+                .await?;
+        }
+        let a_before: Vec<Msg> = agent_a.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            a_before.iter().all(|m| m.channel_id == 1 || m.channel_id == 3),
+            "agent A (scope {{1,3}}) must never see channel 2 before rekey"
+        );
+        assert!(
+            a_before.iter().any(|m| m.channel_id == 1)
+                && a_before.iter().any(|m| m.channel_id == 3),
+            "agent A must see both its channels before rekey"
+        );
+        let b_before: Vec<Msg> = agent_b.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            b_before.iter().all(|m| m.channel_id == 2),
+            "agent B (scope {{2}}) must see only channel 2 before rekey"
+        );
+        assert!(
+            b_before.iter().any(|m| m.body == "b-pre-2"),
+            "agent B must see its channel-2 message before rekey"
+        );
+
+        // Force a real group rekey (standalone). Both scoped members survive and
+        // must be re-delivered their (and only their) channel keys.
+        alice.recover_via_fast_forward().await?;
+        alice.rekey().await?;
+
+        // NEW messages under the new epoch, one per channel.
+        for (ch, body) in [(1i64, "a-post-1"), (2, "b-post-2"), (3, "a-post-3")] {
+            alice
+                .table::<Msg>("msgs")
+                .insert(&Msg {
+                    id: None,
+                    channel_id: ch,
+                    body: body.into(),
+                })
+                .execute()
+                .await?;
+        }
+
+        // Agent A refreshes and must read the NEW ch1 AND ch3 messages, never ch2.
+        agent_a.refresh_scoped_keys().await?;
+        let a_after: Vec<Msg> = agent_a.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            a_after.iter().any(|m| m.body == "a-post-1"),
+            "agent A must read the NEW channel-1 message after the rekey"
+        );
+        assert!(
+            a_after.iter().any(|m| m.body == "a-post-3"),
+            "agent A must read the NEW channel-3 message after the rekey"
+        );
+        assert!(
+            a_after.iter().all(|m| m.channel_id == 1 || m.channel_id == 3),
+            "agent A must NEVER read channel 2 (agent B's channel)"
+        );
+        assert!(
+            !a_after.iter().any(|m| m.body == "b-post-2"),
+            "agent A must not decrypt agent B's channel-2 message"
+        );
+
+        // Agent B refreshes and must read ONLY the NEW ch2 message.
+        agent_b.refresh_scoped_keys().await?;
+        let b_after: Vec<Msg> = agent_b.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            b_after.iter().any(|m| m.body == "b-post-2"),
+            "agent B must read the NEW channel-2 message after the rekey"
+        );
+        assert!(
+            b_after.iter().all(|m| m.channel_id == 2),
+            "agent B must NEVER read channel 1 or 3 (agent A's channels)"
+        );
+        Ok(())
+    }
+
+    /// L2 Part B (Task 7, Step 3): no-harm regression. With a scoped member
+    /// present (so the Part B re-grant machinery runs), a FULL member's
+    /// invite/join/rekey/read lifecycle is unchanged — Bob reads channel data
+    /// under the current epoch before the rekey, and reads NEW channel data
+    /// under the fresh epoch after it (i.e. Part B did not disturb full-member
+    /// group-key delivery). And the Part A read boundary still holds: the scoped
+    /// member cannot read a channel it was never granted.
+    ///
+    /// NOTE on epochs: channel keys are `channel_root(current_group_key, ch)`
+    /// with a fixed sequence (`CHANNEL_SUBSEQ = 0`), so a rekey rotates every
+    /// channel key and PRE-rekey channel rows become undecryptable to EVERYONE —
+    /// full and scoped alike. That is the shipped L2 channel-key model
+    /// (`crypto::channel_encryption_key` / `TreeSpaceKey::data_key_for_key_id`),
+    /// predating and orthogonal to Part B, whose scope is forward access to NEW
+    /// messages. So this test asserts pre-rekey reads BEFORE the rekey and
+    /// post-rekey reads AFTER it, never cross-epoch channel reads.
+    ///
+    /// TEETH: Bob reading the POST-rekey rows fails if Part B disturbed
+    /// full-member group-key delivery (a full member that lost the new group key
+    /// could not derive the new channel keys); the scoped member reading channel
+    /// 5 (never granted) would fail the `all channel == 1` assert if the read
+    /// boundary regressed.
+    #[tokio::test]
+    async fn full_members_unaffected_by_part_b() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // A FULL member joins.
+        let bob_invite = alice.invite_user().await?;
+        let bob = crate::Space::join(transport.clone(), bob_invite, schema()).await?;
+        bob.register_table_schema(msgs_schema()?);
+
+        // A scoped member (channel 1 only) also joins, so the rekey exercises
+        // the Part B re-grant path alongside full-member group-key delivery.
+        let agent_invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), agent_invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Pre-rekey data in two channels (1 = scoped agent's channel, 5 = not).
+        for (ch, body) in [(1i64, "pre ch1"), (5, "pre ch5")] {
+            alice
+                .table::<Msg>("msgs")
+                .insert(&Msg {
+                    id: None,
+                    channel_id: ch,
+                    body: body.into(),
+                })
+                .execute()
+                .await?;
+        }
+
+        // Baseline: the full member reads BOTH channels under the current epoch.
+        bob.sync().await?;
+        let bob_before: Vec<Msg> = bob.table::<Msg>("msgs").select().all().await?;
+        for body in ["pre ch1", "pre ch5"] {
+            assert!(
+                bob_before.iter().any(|m| m.body == body),
+                "full member must read '{body}' before the rekey (baseline full read)"
+            );
+        }
+
+        // A FULL member drives a rekey (mixed recipient set: full members get
+        // the group key, the scoped member is excluded + re-granted).
+        alice.recover_via_fast_forward().await?;
+        alice.rekey().await?;
+
+        // Post-rekey data under the fresh epoch.
+        for (ch, body) in [(1i64, "post ch1"), (5, "post ch5")] {
+            alice
+                .table::<Msg>("msgs")
+                .insert(&Msg {
+                    id: None,
+                    channel_id: ch,
+                    body: body.into(),
+                })
+                .execute()
+                .await?;
+        }
+
+        // Full member Bob still receives the group key across the rekey and
+        // reads the NEW data — unchanged by Part B.
+        bob.sync().await?;
+        let bob_after: Vec<Msg> = bob.table::<Msg>("msgs").select().all().await?;
+        for body in ["post ch1", "post ch5"] {
+            assert!(
+                bob_after.iter().any(|m| m.body == body),
+                "full member must read '{body}' after the rekey \
+                 (Part B must not disturb full group-key delivery)"
+            );
+        }
+
+        // Part A property intact: the scoped member (channel 1) reads its
+        // channel's post-rekey message but CANNOT read the un-granted channel 5.
+        agent.refresh_scoped_keys().await?;
+        let agent_rows: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            agent_rows.iter().any(|m| m.body == "post ch1"),
+            "scoped member must still read its own channel after the rekey"
+        );
+        assert!(
+            agent_rows.iter().all(|m| m.channel_id == 1),
+            "scoped member must NOT read the un-granted channel 5 (Part A boundary intact)"
+        );
         Ok(())
     }
 }

@@ -29,6 +29,9 @@ pub(crate) fn start_listener(space: &Space) {
     let updates_tx = space.updates_tx.clone();
     let serialize_mutations = Arc::clone(&space.serialize_mutations);
     let ff_in_progress = Arc::clone(&space.ff_in_progress);
+    let last_scoped_delivery = Arc::clone(&space.last_scoped_delivery);
+    #[cfg(any(test, feature = "testing"))]
+    let scoped_install_calls = Arc::clone(&space.scoped_install_calls);
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
         loop {
@@ -45,6 +48,9 @@ pub(crate) fn start_listener(space: &Space) {
                         updates_tx: updates_tx.clone(),
                         serialize_mutations: Arc::clone(&serialize_mutations),
                         ff_in_progress: Arc::clone(&ff_in_progress),
+                        last_scoped_delivery: Arc::clone(&last_scoped_delivery),
+                        #[cfg(any(test, feature = "testing"))]
+                        scoped_install_calls: Arc::clone(&scoped_install_calls),
                     };
                     space.handle_broadcast(evt.clone()).await;
                     drop(space);

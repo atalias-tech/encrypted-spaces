@@ -28,7 +28,10 @@ use encrypted_spaces_key_manager::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::simple_line2::{DefaultProver, SimpleLine2RuntimeProver, SimpleLine2SpaceKey};
+use crate::simple_line2::{
+    ChannelGrantProofInput, ChannelGrantVerifyInput, DefaultDerivation, DefaultProver,
+    SimpleLine2RuntimeProver, SimpleLine2SpaceKey,
+};
 use crate::tree_keys::{channel_data_key, channel_root, TreeKeyId};
 
 /// The tree read plane. Either a full member (holds the group key) or a scoped
@@ -85,6 +88,50 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         self.group
             .as_ref()
             .map(|g| channel_root(&g.current_group_key(), channel))
+    }
+
+    /// Produce the §4.3 channel-grant derivation proof for `channel`: attests
+    /// that the delivered subtree key is the group key's structural derivation
+    /// (`channel_root(group_key, channel)`), rather than an unrelated or
+    /// wrongly-labelled key. Full members only (`None` for a scoped member,
+    /// which holds no group key).
+    ///
+    /// The committed channel key equals `channel_subtree_key(channel)`'s
+    /// commitment, so the same commitment serves as the mVE delivery's
+    /// `binding_commitment` AND the persisted grant record's value — one key,
+    /// one commitment, one proof.
+    pub fn prove_channel_grant(&self, channel: i64) -> Option<Vec<u8>> {
+        let group_key = self.group.as_ref()?.current_group_key();
+        self.channel_grant_for_group_key(&group_key, channel)
+            .map(|(_subtree, proof)| proof)
+    }
+
+    /// Derive `(subtree key, §4.3 grant proof)` for `channel` from an
+    /// **explicit** `group_key`, rather than the currently installed one.
+    ///
+    /// This is the rekey re-delivery counterpart to [`Self::channel_subtree_key`]
+    /// + [`Self::prove_channel_grant`] (which derive from the installed group
+    /// key): during a rekey the NEW group key is freshly generated and not yet
+    /// installed locally, so scoped members' refreshed channel keys must be
+    /// derived against the caller-supplied new key. The returned subtree key is
+    /// the mVE delivery payload; its commitment serves as both the delivery
+    /// `binding_commitment` and the persisted grant record — one key, one
+    /// commitment, one proof.
+    pub fn channel_grant_for_group_key(
+        &self,
+        group_key: &KeyMaterial,
+        channel: i64,
+    ) -> Option<(KeyMaterial, Vec<u8>)> {
+        let channel_key = channel_root(group_key, channel);
+        let proof = P::default()
+            .prove_channel_grant_runtime(ChannelGrantProofInput {
+                derivation: &DefaultDerivation::default(),
+                group_key: group_key.clone(),
+                channel,
+                channel_key: channel_key.clone(),
+            })
+            .ok()?;
+        Some((channel_key, proof))
     }
 
     /// Install a delivered channel subtree key (scoped grant).
@@ -242,6 +289,29 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> SpaceKey for TreeSpaceKey<P> {
     ) -> Result<KeyCommitment, KeyManagerError> {
         SimpleLine2SpaceKey::<P>::canonical_group_key_commitment(reader).await
     }
+}
+
+/// Verify a channel-grant derivation proof (server side, L2 read scoping):
+/// attests that `channel_commitment` is the §4.3 structural derivation of
+/// `group_commitment` for `channel` (`channel_root(group_key, channel)`),
+/// rejecting a client that commits a channel key not actually derived from the
+/// current group key. Stateless — the server calls this per grant row before
+/// letting it land. Uses the compile-time [`DefaultProver`] so it verifies the
+/// same proof bytes [`TreeSpaceKey::prove_channel_grant`] emits.
+pub fn verify_channel_grant(
+    channel: i64,
+    group_commitment: KeyCommitment,
+    channel_commitment: KeyCommitment,
+    proof: &[u8],
+) -> Result<(), KeyManagerError> {
+    DefaultProver::default().verify_channel_grant_runtime(
+        ChannelGrantVerifyInput {
+            channel,
+            group_commitment,
+            channel_commitment,
+        },
+        proof,
+    )
 }
 
 #[cfg(test)]

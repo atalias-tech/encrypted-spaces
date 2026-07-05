@@ -131,6 +131,9 @@ impl Space {
             updates_tx: tokio::sync::broadcast::channel(64).0,
             serialize_mutations: Arc::new(tokio::sync::Mutex::new(())),
             ff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_scoped_delivery: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "testing"))]
+            scoped_install_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         crate::broadcast::start_listener(&space);
         Ok(space)

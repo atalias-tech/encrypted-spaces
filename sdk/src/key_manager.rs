@@ -32,13 +32,17 @@ impl KeyManagerHandle {
             .map_err(|_| SdkError::ValidationError("create_invite failed".to_string()))
     }
 
-    pub async fn rekey(
+    /// Perform a rekey, returning the request AND the freshly generated group
+    /// key material so the caller can re-derive scoped members' channel subtree
+    /// keys against the NEW epoch (L2 Part B rekey re-delivery). The local
+    /// group key is not installed here (that happens on delivery processing).
+    pub async fn rekey_with_group_key(
         &self,
         remaining_members: &[SpacePublicKey],
         builder: &mut dyn OperationBuilder,
-    ) -> Result<RekeyRequest> {
+    ) -> Result<(RekeyRequest, encrypted_spaces_crypto::KeyMaterial)> {
         let km = self.space.key_manager.lock().await;
-        km.rekey(remaining_members, builder)
+        km.rekey_with_group_key(remaining_members, builder)
             .await
             .map_err(|_| SdkError::ValidationError("rekey failed".to_string()))
     }
@@ -78,15 +82,27 @@ impl Space {
             .map(|u| u.update_key.clone())
             .collect();
 
-        // 2. Build the rekey request via key_manager.
+        // 2. Build the rekey request via key_manager, keeping the freshly
+        //    generated group key so we can refresh scoped members' channel keys
+        //    against the NEW epoch (L2 Part B).
         let mut rekey_builder = self.retention_builder();
-        let rekey_request = self
+        let (mut rekey_request, new_group_key) = self
             .key_manager()
-            .rekey(&remaining_pks, &mut rekey_builder)
+            .rekey_with_group_key(&remaining_pks, &mut rekey_builder)
             .await?;
         let rekey_output = rekey_builder.finalize();
-        let retention_writes = rekey_output.writes;
+        let mut retention_writes = rekey_output.writes;
         let retention_proofs = rekey_output.proofs;
+
+        // 2b. L2 Part B: re-derive + re-deliver each scoped member's channel
+        //     keys against the new group key. Refreshed grant rows ride in the
+        //     signed Rekey op (guest-validated); deliveries + proofs ride in the
+        //     rekey request (server-verified, then re-deposited as fresh
+        //     ScopedDeliveryEnvelopes). A standalone rekey removes no one.
+        let (scoped_regrants, grant_writes) =
+            self.build_scoped_regrants(&new_group_key, None).await?;
+        rekey_request.scoped_regrants = scoped_regrants;
+        retention_writes.extend(grant_writes);
 
         // 3. Build changelog entry.
         let change = {

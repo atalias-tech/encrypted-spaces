@@ -1,7 +1,7 @@
 use super::{
     append_multi_row_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
-    derive_column_keys_for_chain, read_next_id, read_schema_columns, table_from_column_keys,
-    validate_user_access, OpReader, OpVerifier, OpVerifyResult,
+    derive_column_keys_for_chain, read_next_id, read_schema_columns, reject_channel_grant_entries,
+    table_from_column_keys, validate_user_access, OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError, OpType};
 use crate::{BatchOp, TraceStep};
@@ -37,6 +37,10 @@ impl OpVerifier for ExtendOp {
         }
 
         validate_user_access(entry, OpType::Extend, "extend", reader)?;
+
+        // Extend is a generic retention write; it may never carry channel-grant
+        // rows (those are issued only by invite/rekey, bound to a target uid).
+        reject_channel_grant_entries(&entry.message.entries, "extend")?;
 
         // Schema columns + counter are needed to derive the real per-row keys.
         let expected_retention_cols =
@@ -121,12 +125,39 @@ mod tests {
     use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
     use encrypted_spaces_storage_encoding::{
         encode_column_names,
-        keys::{column_key, schema_columns_key},
+        keys::{column_key, schema_columns_key, schema_indexes_key, schema_next_id_key},
     };
     use std::collections::BTreeSet;
 
     fn user_status_key(uid: u32) -> Vec<u8> {
         column_key("_users", uid as i64, "status")
+    }
+
+    fn stored_str(s: &str) -> Vec<u8> {
+        value_to_bytes(&serde_json::json!(s)).unwrap()
+    }
+
+    /// Build an Extend entry from explicit (key, value) pairs so tests can
+    /// control the `_retention` "key"-column payload (e.g. a channel-grant
+    /// logical key).
+    fn make_extend_entry_kv(uid: u32, kvs: Vec<(Vec<u8>, Vec<u8>)>) -> ChangelogEntry {
+        let entries: Vec<KvData> = kvs
+            .into_iter()
+            .map(|(key, value)| KvData { key, value })
+            .collect();
+        ChangelogEntry {
+            timestamp: 1000,
+            uid,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::Extend,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        }
     }
 
     fn make_extend_entry(uid: u32, retention_keys: &[Vec<u8>]) -> ChangelogEntry {
@@ -211,6 +242,125 @@ mod tests {
         assert!(
             msg.contains("retention columns target table"),
             "unexpected error: {msg}"
+        );
+    }
+
+    /// A channel-grant `_retention` row (`sl2/channel_grant/{uid}/{channel}`
+    /// in the "key" column) must NOT be writable via Extend — grants may only
+    /// be issued by invite/rekey. Extend is a generic retention write any
+    /// non-provisional member may sign; without this gate a scoped member
+    /// could forge itself extra channel grants that a later honest rekey would
+    /// honor (the decoy class Part A closed for `_users`).
+    ///
+    /// RED before fix: `extract_and_validate` returns `Ok` (Extend accepts
+    /// arbitrary `_retention` rows today). GREEN after: `Err` mentioning
+    /// `channel_grant` / not allowed in extend.
+    #[test]
+    fn test_channel_grant_row_rejected_for_extend() {
+        let uid = 1u32;
+        // One _retention row: "key" col = grant logical key, "value" = commitment.
+        let key_col = column_key("_retention", 0, "key");
+        let value_col = column_key("_retention", 0, "value");
+        let entry = make_extend_entry_kv(
+            uid,
+            vec![
+                (key_col, stored_str("sl2/channel_grant/9/7")),
+                (value_col, vec![0xAA; 32]),
+            ],
+        );
+
+        // Full valid-extend read sequence so CURRENT code runs to completion
+        // and returns Ok (proving the RED gap): status → schema_columns →
+        // schema_next_id → schema_indexes (the "key" column is indexed).
+        let retention_cols: BTreeSet<String> =
+            ["key", "value"].into_iter().map(str::to_string).collect();
+        let sk = user_status_key(uid);
+        let reads = vec![
+            ProvenRead {
+                op: ReadOp::Key(sk.clone()),
+                results: vec![(sk, value_to_bytes(&serde_json::json!(1)).unwrap())],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_columns_key("_retention")),
+                results: vec![(
+                    schema_columns_key("_retention"),
+                    encode_column_names(&retention_cols),
+                )],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_next_id_key("_retention")),
+                results: vec![(
+                    schema_next_id_key("_retention"),
+                    1i64.to_be_bytes().to_vec(),
+                )],
+            },
+            ProvenRead {
+                op: ReadOp::Key(schema_indexes_key("_retention")),
+                results: vec![(schema_indexes_key("_retention"), b"key".to_vec())],
+            },
+        ];
+        let mut reader = VerifierReader::new(&reads);
+
+        let result = ExtendOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext::default(),
+        );
+        assert!(
+            result.is_err(),
+            "channel_grant _retention row must be rejected by Extend, got Ok \
+             (forgery accepted)"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("channel_grant"),
+            "expected a channel_grant rejection, got: {msg}"
+        );
+    }
+
+    /// A multi-row Extend that hides a channel-grant row behind a legitimate
+    /// (non-grant) retention row must still be rejected — every row is checked,
+    /// not just the first. The benign row sorts first by column value; the
+    /// grant row is the second chain element.
+    #[test]
+    fn test_channel_grant_multi_row_decoy_rejected_for_extend() {
+        let uid = 1u32;
+        let key_col = column_key("_retention", 0, "key");
+        let value_col = column_key("_retention", 0, "value");
+        // Row 0: benign retention key. Row 1: forged grant. Same placeholder
+        // keys per column; the per-row values distinguish the chain elements.
+        let entry = make_extend_entry_kv(
+            uid,
+            vec![
+                (key_col.clone(), stored_str("sl2/fgk/row/0")),
+                (value_col.clone(), vec![0xAA; 32]),
+                (key_col, stored_str("sl2/channel_grant/9/7")),
+                (value_col, vec![0xBB; 32]),
+            ],
+        );
+
+        // The grant gate runs right after validate_user_access, so only the
+        // signer's status read is consumed before the rejection.
+        let sk = user_status_key(uid);
+        let reads = vec![ProvenRead {
+            op: ReadOp::Key(sk.clone()),
+            results: vec![(sk, value_to_bytes(&serde_json::json!(1)).unwrap())],
+        }];
+        let mut reader = VerifierReader::new(&reads);
+
+        let result = ExtendOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext::default(),
+        );
+        assert!(
+            result.is_err(),
+            "a grant row hidden behind a benign retention row must be rejected"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("channel_grant"),
+            "expected a channel_grant rejection, got: {msg}"
         );
     }
 

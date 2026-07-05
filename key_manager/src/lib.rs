@@ -1,3 +1,4 @@
+pub mod channel_grant;
 pub mod error;
 pub mod no_retention;
 pub mod operation;
@@ -113,6 +114,25 @@ impl<G: SpaceKey> KeyManager<G> {
         remaining_members_pks: &[<DefaultMkem as Mkem>::PublicKey],
         builder: &mut dyn OperationBuilder,
     ) -> Result<RekeyRequest, KeyManagerError> {
+        let (request, _new_root_key) = self.rekey_with_group_key(remaining_members_pks, builder).await?;
+        Ok(request)
+    }
+
+    /// Like [`Self::rekey`] but also returns the freshly generated group key
+    /// material, so an L2 caller can re-derive scoped members' channel subtree
+    /// keys (`channel_root(new_group_key, channel)`) against the NEW epoch for
+    /// Part B rekey re-delivery.
+    ///
+    /// The key is **not** installed locally (identical to [`Self::rekey`]);
+    /// the local commit still happens when the sender processes their own
+    /// delivered envelope. The returned `RekeyRequest.scoped_regrants` is
+    /// empty — the caller (which knows the channel derivation + membership)
+    /// fills it in before submitting.
+    pub async fn rekey_with_group_key(
+        &self,
+        remaining_members_pks: &[<DefaultMkem as Mkem>::PublicKey],
+        builder: &mut dyn OperationBuilder,
+    ) -> Result<(RekeyRequest, KeyMaterial), KeyManagerError> {
         let (new_root_commitment, new_root_key) =
             self.space_key.generate_group_key(builder).await?;
 
@@ -123,10 +143,14 @@ impl<G: SpaceKey> KeyManager<G> {
             REKEY_SESSION_ID,
         );
 
-        Ok(RekeyRequest {
-            new_root_commitment,
-            proof,
-        })
+        Ok((
+            RekeyRequest {
+                new_root_commitment,
+                proof,
+                scoped_regrants: Vec::new(),
+            },
+            new_root_key,
+        ))
     }
 
     /// Decrypt an mVE-wrapped group-key envelope and verify its commitment.

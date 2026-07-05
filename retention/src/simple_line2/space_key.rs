@@ -22,6 +22,7 @@ use super::proof::{
     SimpleLine2RuntimeProver,
 };
 use super::store::*;
+use crate::tree_keys::{channel_root, channel_root_tag};
 
 type Derivation = DerivationKoalaBearPoseidon2_16;
 
@@ -36,6 +37,33 @@ pub(super) const HGK_DERIVE_TAG: &[u8] = b"simpleline2/v1/hgk-derive";
 
 pub(super) fn tag(bytes: &[u8]) -> DerivationTag {
     DerivationTag::from_bytes(bytes)
+}
+
+/// Build the channel-grant derive tag for `channel`.
+///
+/// This **must** be the exact same tag [`channel_root`] uses — the STARK
+/// proof attests that a delivered channel key really is `channel_root`'s
+/// derivation of the group key, so a different (even similarly-shaped) tag
+/// here would make the transition's derive edge compute an unrelated key and
+/// every honest proof would fail to verify. Delegates to
+/// [`crate::tree_keys::channel_root_tag`] instead of re-deriving the tag
+/// string so the two call sites cannot drift apart.
+pub(super) fn channel_grant_tag(channel: i64) -> DerivationTag {
+    channel_root_tag(channel)
+}
+
+/// Public commitment for a channel-grant proof: commits to the channel key
+/// structurally derived from `group_key` for `channel` (via
+/// [`channel_root`]). Convenience for callers building
+/// `ChannelGrantVerifyInput`/`ChannelGrantProofInput` so they don't need to
+/// re-derive and commit the channel key inline.
+// No non-test caller yet: consumed by the L2 Part B scoped-invite grant
+// write (plan Task 4), which builds the ChannelGrant proof inputs at the
+// grant-write site. Remove the allow when that lands.
+#[allow(dead_code)]
+pub(crate) fn channel_grant_commitment(group_key: &KeyMaterial, channel: i64) -> KeyCommitment {
+    let derivation = Derivation::default();
+    derivation.commit(&channel_root(group_key, channel))
 }
 
 // =========================================================================

@@ -1,0 +1,16 @@
+// Bootstrap schema for the L2 Part B WebSocket production-path test
+// (`sdk/tests/l2_part_b_ws.rs`). A channel-scoped `msgs` table: a plaintext
+// `channel_id` (the L2 routing key) drives per-channel key derivation, and the
+// `body` column is encrypted under the channel's subtree key. Mirrors the
+// in-tree `msgs_schema()` helper used by the LocalTransport crypto tests.
+//
+// The backend server is started with `--schema <this file>` (here, via
+// `BootstrapDataSource::SchemaFile`) and derives the identical merk root on
+// bootstrap; the test anchors its clients to that same root by computing it
+// from a throwaway `LocalTransport::from_schema_file(<this file>)`.
+
+table "msgs" {
+    column "id"         type="int"     plaintext=#true
+    column "channel_id" type="int"     plaintext=#true indexed=#true
+    column "body"       type="string"
+}

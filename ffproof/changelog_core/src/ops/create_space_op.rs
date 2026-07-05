@@ -1,8 +1,8 @@
 use super::{
     append_multi_row_insert_index_puts, bump_next_id_after_chain, column_names_from_keys,
     derive_column_keys_for_chain, derive_column_keys_with_row_id, next_id_after, next_id_put,
-    partition_composite_entry, read_next_id, read_schema_columns, OpReader, OpVerifier,
-    OpVerifyResult,
+    partition_composite_entry, read_next_id, read_schema_columns, reject_channel_grant_entries,
+    OpReader, OpVerifier, OpVerifyResult,
 };
 use crate::changelog::{ChangelogEntry, ChangelogError};
 use crate::{BatchOp, ReadOp, TraceStep};
@@ -28,6 +28,11 @@ impl OpVerifier for CreateSpaceOp {
                 "create_space: _users entries must not be empty".to_string(),
             ));
         }
+
+        // Genesis has exactly one member (the creator, a full member) and no
+        // scoped members, so a channel-grant row can never legitimately appear
+        // here. Reject any to prevent seeding a forged grant at space creation.
+        reject_channel_grant_entries(&retention_entries, "create_space")?;
 
         // --- Verify no users exist yet ---
         let users_read = reader.read(ReadOp::Prefix(crate::row_prefix(crate::USERS_TABLE)))?;
@@ -132,5 +137,79 @@ impl OpVerifier for CreateSpaceOp {
         Ok(OpVerifyResult {
             write_steps: vec![TraceStep::Write(batch_ops)],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changelog::{KvData, LogMessage, OpType};
+    use crate::ops::VerifierReader;
+    use encrypted_spaces_storage_encoding::keys::column_key;
+    use encrypted_spaces_storage_encoding::stored_value::value_to_bytes;
+
+    fn stored_str(s: &str) -> Vec<u8> {
+        value_to_bytes(&serde_json::json!(s)).unwrap()
+    }
+
+    /// A channel-grant `_retention` row must never appear in CreateSpace:
+    /// genesis has exactly one member (the full-member creator) and no scoped
+    /// members, so any grant row is a forgery attempt and is rejected — before
+    /// any state read.
+    #[test]
+    fn test_channel_grant_row_rejected_for_create_space() {
+        let creator = 0u32;
+        // A full _users insert (placeholder row_id) + a forged grant row.
+        let user_keys = [
+            column_key("_users", 0, "auth_key"),
+            column_key("_users", 0, "status"),
+            column_key("_users", 0, "update_key"),
+        ];
+        let mut entries: Vec<KvData> = user_keys
+            .iter()
+            .map(|key| KvData {
+                key: key.clone(),
+                value: vec![0xAA; 32],
+            })
+            .collect();
+        entries.push(KvData {
+            key: column_key("_retention", 0, "key"),
+            value: stored_str("sl2/channel_grant/1/7"),
+        });
+        entries.push(KvData {
+            key: column_key("_retention", 0, "value"),
+            value: vec![0xBB; 32],
+        });
+
+        let entry = ChangelogEntry {
+            timestamp: 1000,
+            uid: creator,
+            parent_change: 0,
+            message: LogMessage {
+                op_type: OpType::CreateSpace,
+                tree_path: vec![],
+                entries,
+            },
+            sig_ref: 0,
+            parent_clc: [0u8; 32],
+            signature: vec![],
+        };
+
+        let reads = vec![];
+        let mut reader = VerifierReader::new(&reads);
+        let result = CreateSpaceOp::extract_and_validate(
+            &entry,
+            &mut reader,
+            &super::super::OpContext::default(),
+        );
+        assert!(
+            result.is_err(),
+            "channel_grant _retention row must be rejected by CreateSpace"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("channel_grant"),
+            "expected a channel_grant rejection, got: {msg}"
+        );
     }
 }

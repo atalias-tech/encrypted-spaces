@@ -97,6 +97,32 @@ pub struct DeleteKeysVerifyInput<'a> {
 }
 
 // =========================================================================
+// ChannelGrant
+// =========================================================================
+
+/// Proves a channel key is the structural derivation of a group key for a
+/// specific channel (§4.3 read scoping): `channel_key = derive(group_key,
+/// channel_grant_tag(channel))`. Unlike Extend/Rekey/DeleteKeys, the public
+/// commitments are not read from persisted table rows — they are computed
+/// from the raw keys by the prover/verifier themselves, since a channel
+/// grant is a standalone statement about a key relationship rather than a
+/// storage mutation.
+#[derive(Clone, Debug)]
+pub struct ChannelGrantProofInput<'a, D: KeyDerivation> {
+    pub derivation: &'a D,
+    pub group_key: KeyMaterial,
+    pub channel: i64,
+    pub channel_key: KeyMaterial,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelGrantVerifyInput {
+    pub channel: i64,
+    pub group_commitment: KeyCommitment,
+    pub channel_commitment: KeyCommitment,
+}
+
+// =========================================================================
 // Trait
 // =========================================================================
 
@@ -109,6 +135,7 @@ pub trait SimpleLine2Proofs<D: KeyDerivation> {
     type ExtendProof;
     type RekeyProof;
     type DeleteKeysProof;
+    type ChannelGrantProof;
     type Error;
 
     fn prove_extend(
@@ -130,6 +157,17 @@ pub trait SimpleLine2Proofs<D: KeyDerivation> {
     fn verify_delete_keys(
         &self,
         input: DeleteKeysVerifyInput<'_>,
+        proof: &[u8],
+    ) -> Result<(), Self::Error>;
+
+    fn prove_channel_grant(
+        &self,
+        input: ChannelGrantProofInput<'_, D>,
+    ) -> Result<Self::ChannelGrantProof, Self::Error>;
+
+    fn verify_channel_grant(
+        &self,
+        input: ChannelGrantVerifyInput,
         proof: &[u8],
     ) -> Result<(), Self::Error>;
 }
@@ -197,6 +235,22 @@ pub trait SimpleLine2RuntimeProver: Default + Clone {
         input: DeleteKeysVerifyInput<'_>,
         proof: &[u8],
     ) -> Result<(), KeyManagerError>;
+
+    /// Prove that a channel key is the §4.3 structural derivation of the group
+    /// key (L2 read scoping). Carried through the runtime path so scoped-invite
+    /// / rekey re-grant sites can attach a derivation proof to each grant row
+    /// without depending on the concrete backend prover type.
+    fn prove_channel_grant_runtime(
+        &self,
+        input: ChannelGrantProofInput<'_, DefaultDerivation>,
+    ) -> Result<Vec<u8>, KeyManagerError>;
+
+    /// Verify a channel-grant derivation proof against public commitments.
+    fn verify_channel_grant_runtime(
+        &self,
+        input: ChannelGrantVerifyInput,
+        proof: &[u8],
+    ) -> Result<(), KeyManagerError>;
 }
 
 // =========================================================================
@@ -213,6 +267,7 @@ impl<D: KeyDerivation> SimpleLine2Proofs<D> for NoProver {
     type ExtendProof = Vec<u8>;
     type RekeyProof = Vec<u8>;
     type DeleteKeysProof = Vec<u8>;
+    type ChannelGrantProof = Vec<u8>;
     type Error = Infallible;
 
     fn prove_extend(
@@ -248,6 +303,21 @@ impl<D: KeyDerivation> SimpleLine2Proofs<D> for NoProver {
     fn verify_delete_keys(
         &self,
         _input: DeleteKeysVerifyInput<'_>,
+        _proof: &[u8],
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn prove_channel_grant(
+        &self,
+        _input: ChannelGrantProofInput<'_, D>,
+    ) -> Result<Self::ChannelGrantProof, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn verify_channel_grant(
+        &self,
+        _input: ChannelGrantVerifyInput,
         _proof: &[u8],
     ) -> Result<(), Self::Error> {
         Ok(())
@@ -303,6 +373,23 @@ impl SimpleLine2RuntimeProver for NoProver {
         proof: &[u8],
     ) -> Result<(), KeyManagerError> {
         <Self as SimpleLine2Proofs<DefaultDerivation>>::verify_delete_keys(self, input, proof)
+            .map_err(|never| match never {})
+    }
+
+    fn prove_channel_grant_runtime(
+        &self,
+        input: ChannelGrantProofInput<'_, DefaultDerivation>,
+    ) -> Result<Vec<u8>, KeyManagerError> {
+        <Self as SimpleLine2Proofs<DefaultDerivation>>::prove_channel_grant(self, input)
+            .map_err(|never| match never {})
+    }
+
+    fn verify_channel_grant_runtime(
+        &self,
+        input: ChannelGrantVerifyInput,
+        proof: &[u8],
+    ) -> Result<(), KeyManagerError> {
+        <Self as SimpleLine2Proofs<DefaultDerivation>>::verify_channel_grant(self, input, proof)
             .map_err(|never| match never {})
     }
 }
@@ -455,6 +542,37 @@ mod tests {
                 dgk_commitment: d.commit(&new_hgk),
                 survivors: &survivors,
                 next_links: &next_links,
+            },
+            &proof,
+        )
+        .expect("verify");
+    }
+
+    #[test]
+    fn no_prover_channel_grant_round_trip() {
+        let d = derivation();
+        let group_key = KeyMaterial::random();
+        let channel_key = KeyMaterial::random();
+
+        let prover = NoProver;
+        let proof = <Prover as SimpleLine2Proofs<DefaultDerivation>>::prove_channel_grant(
+            &prover,
+            ChannelGrantProofInput {
+                derivation: &d,
+                group_key: group_key.clone(),
+                channel: 3,
+                channel_key: channel_key.clone(),
+            },
+        )
+        .expect("prove");
+        assert!(proof.is_empty());
+
+        <Prover as SimpleLine2Proofs<DefaultDerivation>>::verify_channel_grant(
+            &prover,
+            ChannelGrantVerifyInput {
+                channel: 3,
+                group_commitment: d.commit(&group_key),
+                channel_commitment: d.commit(&channel_key),
             },
             &proof,
         )

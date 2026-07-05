@@ -73,6 +73,16 @@ impl std::fmt::Display for TreeKeyId {
 
 impl encrypted_spaces_key_manager::KeyId for TreeKeyId {}
 
+/// The derive tag `channel_root` uses for `channel` — exposed (rather than
+/// inlined) so other code that must reconstruct the *same* group→channel
+/// derivation edge (e.g. the channel-grant STARK proof in
+/// `simple_line2::stark_proofs`, which proves a delivered channel key really
+/// is this derivation of the group key) uses an identical tag rather than a
+/// parallel one that would derive a different key.
+pub(crate) fn channel_root_tag(channel: i64) -> DerivationTag {
+    DerivationTag::from_bytes(format!("{CHANNEL_ROOT_TAG_PREFIX}{channel}").as_bytes())
+}
+
 /// Derive a channel's **subtree key** from the group key and the channel id
 /// (§4.3 "each directory key is derived from its parent's key"). Poseidon
 /// derivation → a valid [`KeyMaterial`], so it can be mVE-delivered to a scoped
@@ -81,9 +91,7 @@ impl encrypted_spaces_key_manager::KeyId for TreeKeyId {}
 /// is delivered it.
 pub fn channel_root(group_key: &KeyMaterial, channel: i64) -> KeyMaterial {
     let derivation = DerivationKoalaBearPoseidon2_16::default();
-    let tag =
-        DerivationTag::from_bytes(format!("{CHANNEL_ROOT_TAG_PREFIX}{channel}").as_bytes());
-    derivation.derive(group_key, tag)
+    derivation.derive(group_key, channel_root_tag(channel))
 }
 
 /// Derive a channel's **AES data key** at epoch sequence `seq` from its subtree
