@@ -1073,6 +1073,73 @@ mod tests {
         Ok(())
     }
 
+    /// L2 Part B defect fix: a scoped `refresh_scoped_keys` must SKIP a delivery
+    /// envelope it has already consumed, not re-process it.
+    ///
+    /// The server never clears a delivery slot, so the runtime's periodic
+    /// refresh re-fetches the SAME (join) envelope on every rescan. That
+    /// envelope was wrapped to the invitee's PROVISIONAL update key and
+    /// installed at join — but `join` then rotates the update keypair, so
+    /// re-running the mVE unwrap on it can never succeed again and only logs
+    /// "failed to decrypt against anchored commitment; skipping" every tick.
+    /// A redundant refresh with NO new delivery must be a clean no-op: it must
+    /// NOT re-invoke the install path, and it must leave the channel key
+    /// installed (the agent keeps reading).
+    #[tokio::test]
+    async fn refresh_skips_already_consumed_delivery() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "legit ch1".into(),
+            })
+            .execute()
+            .await?;
+
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+        agent.register_table_schema(msgs_schema()?);
+
+        // Join installs the scoped channel key exactly once.
+        assert_eq!(
+            agent.scoped_install_call_count(),
+            1,
+            "join installs the scoped channel key once"
+        );
+
+        // Sanity: the agent reads its channel with the anchored key.
+        let before: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(before.iter().any(|m| m.body == "legit ch1"));
+
+        // No rekey has occurred, so the slot still holds the SAME join envelope.
+        // A redundant refresh must be deduped — NOT re-processed (which would
+        // re-run the now-doomed mVE unwrap and WARN-spam).
+        agent.refresh_scoped_keys().await?;
+        assert_eq!(
+            agent.scoped_install_call_count(),
+            1,
+            "redundant refresh of an unchanged delivery must be deduped, not re-processed"
+        );
+
+        // The channel key remains installed — the agent can still read.
+        let after: Vec<Msg> = agent.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            after.iter().any(|m| m.body == "legit ch1"),
+            "channel key must remain installed after the redundant refresh"
+        );
+        Ok(())
+    }
+
     /// L2 Part B security: `refresh_scoped_keys` must verify each delivered
     /// channel key against its ANCHORED on-chain grant commitment, not the
     /// server-supplied envelope commitment. A malicious server that deposits a

@@ -153,6 +153,29 @@ pub struct Space {
     /// fail fast (the outer apply then rolls back and the caller retries)
     /// instead of deadlocking. See issue #212, fix #4.
     pub(crate) ff_in_progress: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Bytes of the last scoped-delivery envelope this client has already
+    /// installed. The server never clears a delivery slot, so
+    /// `refresh_scoped_keys` re-fetches the SAME envelope on every rescan; the
+    /// JOIN envelope in particular is wrapped to the pre-`rotate_user_keys`
+    /// provisional update key and can NEVER decrypt again, so re-running the
+    /// mVE unwrap on it only produces "failed to decrypt against anchored
+    /// commitment; skipping" WARN spam + wasted work. Skipping an envelope
+    /// whose bytes match this marker avoids that. A genuine rekey re-delivery
+    /// carries DIFFERENT bytes (fresh epoch key, wrapped to the CURRENT key),
+    /// so it never matches and the crown-jewel refresh still installs it. This
+    /// is not a verification bypass — `install_scoped_channels_verified` still
+    /// runs its full anchored-commitment check on every genuinely-new envelope.
+    /// `Arc<Mutex>` so all Space clones (incl. the broadcast listener's
+    /// temporary Space) share one dedup marker.
+    pub(crate) last_scoped_delivery: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
+
+    /// Test-only counter of `install_scoped_channels_verified` invocations, so a
+    /// test can prove the dedup prevents re-processing an unchanged delivery
+    /// (the count stays put across a redundant refresh). Never compiled into
+    /// production builds.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) scoped_install_calls: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Space {
@@ -256,6 +279,9 @@ impl Space {
             updates_tx: tokio::sync::broadcast::channel(64).0,
             serialize_mutations: Arc::new(tokio::sync::Mutex::new(())),
             ff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_scoped_delivery: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "testing"))]
+            scoped_install_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // Build the insert without an explicit id so `_users` (an auto-
@@ -423,6 +449,12 @@ impl Space {
                         .to_string(),
                 ));
             }
+            // Record the join envelope as consumed so the periodic
+            // `refresh_scoped_keys` does not re-process it. After the
+            // `rotate_user_keys` below, this envelope is wrapped to a now-stale
+            // update key and can never decrypt again — re-running the unwrap
+            // would only spam "failed to decrypt" on every rescan.
+            *space.last_scoped_delivery.lock().await = Some(envelope_bytes.clone());
         }
 
         // Rotate provisional invite keypairs → fresh permanent keypairs.
@@ -464,6 +496,9 @@ impl Space {
             updates_tx: tokio::sync::broadcast::channel(64).0,
             serialize_mutations: Arc::new(tokio::sync::Mutex::new(())),
             ff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_scoped_delivery: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "testing"))]
+            scoped_install_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // Register internal table schemas locally (tables are auto-created on the backend)
@@ -620,6 +655,21 @@ impl Space {
             return Ok(());
         };
 
+        // Dedup: the server never clears a delivery slot, so this re-fetches the
+        // SAME envelope on every rescan. The JOIN envelope in particular is
+        // wrapped to the pre-`rotate_user_keys` provisional update key and can
+        // NEVER decrypt again — re-running the unwrap only produces "failed to
+        // decrypt" WARN spam + wasted work. Skip an envelope byte-identical to
+        // the one we last installed. A genuine rekey re-delivery carries a fresh
+        // envelope (new epoch key, wrapped to the CURRENT key → DIFFERENT bytes)
+        // so it never matches here and is processed + installed below (the
+        // crown jewel). This is NOT a verification bypass: it only skips RE-
+        // processing bytes already handled; `install_scoped_channels_verified`
+        // still runs its full anchored-commitment check on every new envelope.
+        if self.last_scoped_delivery.lock().await.as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+
         // A scoped member's slot always holds a ScopedDeliveryEnvelope (never a
         // group-key envelope — the §8 leak-closure invariant). Install each
         // channel key ONLY if it matches its anchored on-chain grant commitment
@@ -632,8 +682,19 @@ impl Space {
         let Some(my_uid) = self.with_state(|s| s.auth_context.uid) else {
             return Ok(());
         };
-        self.install_scoped_channels_verified(my_uid, &scoped.channels)
+        let installed = self
+            .install_scoped_channels_verified(my_uid, &scoped.channels)
             .await?;
+
+        // Record this envelope as consumed ONLY when every delivered channel
+        // installed, so a transient skip — an anchored grant row not yet in
+        // proven state, or a server-substituted key correctly REJECTED by the
+        // anchored-commitment check — is retried on the next rescan rather than
+        // being permanently deduped. (A rejected/partial delivery keeps warning,
+        // which is desirable: a persistent bad delivery is a real signal.)
+        if installed == scoped.channels.len() {
+            *self.last_scoped_delivery.lock().await = Some(bytes);
+        }
         Ok(())
     }
 
@@ -664,6 +725,13 @@ impl Space {
     ) -> Result<usize> {
         use encrypted_spaces_crypto::KeyCommitment;
         use encrypted_spaces_key_manager::channel_grant::grant_row_key;
+
+        // Test-only: count install invocations so a dedup test can prove a
+        // redundant `refresh_scoped_keys` of an unchanged delivery does NOT
+        // re-enter this path (the count stays put).
+        #[cfg(any(test, feature = "testing"))]
+        self.scoped_install_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Phase 1 (async proven reads, no key-manager lock): resolve each
         // channel's anchored grant commitment; keep only deliveries that match.
@@ -729,6 +797,16 @@ impl Space {
         self.key_manager.lock().await.space_key().is_full()
     }
 
+    /// Test-only: how many times `install_scoped_channels_verified` has run on
+    /// this Space (across all clones — the counter is shared). Lets a dedup
+    /// test assert a redundant `refresh_scoped_keys` of an unchanged delivery
+    /// does NOT re-invoke the install path (the count stays put).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn scoped_install_call_count(&self) -> u64 {
+        self.scoped_install_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Testing hook: fetch this member's server-side key-delivery slot over the
     /// member's OWN authenticated transport connection.
     ///
@@ -757,6 +835,9 @@ impl Clone for Space {
             updates_tx: self.updates_tx.clone(),
             serialize_mutations: Arc::clone(&self.serialize_mutations),
             ff_in_progress: Arc::clone(&self.ff_in_progress),
+            last_scoped_delivery: Arc::clone(&self.last_scoped_delivery),
+            #[cfg(any(test, feature = "testing"))]
+            scoped_install_calls: Arc::clone(&self.scoped_install_calls),
         }
     }
 }
