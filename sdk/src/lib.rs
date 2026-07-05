@@ -67,6 +67,11 @@ use encrypted_spaces_key_manager::{CollectingOperationBuilder, GkDeliveryEnvelop
 // dependency.
 pub use encrypted_spaces_retention::tree_keys::TreeKeyId;
 use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
+// `KeyMaterial` appears in `Space::voice_root`'s return type (an unconditional
+// public API) — the voice media plane's per-channel subtree key. Re-export so
+// callers (e.g. `halyard-voice`) can name it without their own direct
+// `encrypted_spaces_crypto` dependency.
+pub use encrypted_spaces_crypto::KeyMaterial;
 
 /// Concrete KeyManager type used throughout the SDK — the per-channel tree read
 /// plane (root line + per-channel SimpleLine2 lines).
@@ -217,6 +222,25 @@ impl Space {
     /// joiners face an ever-longer replay.
     pub fn proof_status(&self) -> (u32, u32) {
         self.with_state(|s| (s.current_change_id, s.verified_up_to))
+    }
+
+    /// The channel's subtree key on the voice media plane (§4.3 Cryptree
+    /// structural derivation) — the same per-channel key
+    /// [`Space::invite_user_scoped`](crate::users) derives to deliver scoped
+    /// read access, exposed here for the app's voice/media layer (e.g. SFrame
+    /// media-encryption key material) to derive without duplicating the
+    /// key-manager lock/derivation sequence.
+    ///
+    /// `Some` for a full member (derives from the current group key). `None`
+    /// for a scoped member: this mirrors
+    /// [`TreeSpaceKey::channel_subtree_key`](encrypted_spaces_retention::tree_space_key::TreeSpaceKey)'s
+    /// contract exactly — derivation needs the group key, which a scoped
+    /// member never holds, so a scoped member gets `None` for *every*
+    /// channel here, even one it was granted delivered read access to (its
+    /// delivered material lives in the read path, not this derivation path).
+    pub async fn voice_root(&self, channel: i64) -> Option<KeyMaterial> {
+        let km = self.key_manager.lock().await;
+        km.space_key().channel_subtree_key(channel)
     }
 
     /// Create a new space adhering to a schema specification as the initial user.
