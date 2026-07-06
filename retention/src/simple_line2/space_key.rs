@@ -256,6 +256,52 @@ pub(crate) async fn resolve_d_key(
     Ok(d_key)
 }
 
+/// Recover the group (GB) key for a past epoch identified by `fgk_ordinal`.
+///
+/// This is the encryption-edge walk [`resolve_d_key`] performs internally
+/// (its `chain[..node_index]` loop above) to reach the GB key covering a
+/// given D sequence — extracted as a standalone primitive so epoch-indexed
+/// channel-key resolution (indexed by `fgk_ordinal`, not by D sequence) can
+/// reuse it directly instead of re-deriving the walk. Does not change
+/// `resolve_d_key`'s behavior.
+///
+/// Walks the live chain from the current HGK newest-to-oldest, decrypting
+/// each node's `older_gb_key_ciphertext` with `derive(&gb_key,
+/// tag(GB_CHAIN_LINK_TAG))`, until the node whose `fgk_ordinal` matches the
+/// target is reached, and returns that node's GB key.
+// No non-test caller yet: consumed by epoch-indexed channel-key resolution
+// (later tasks in this plan). Remove the allow when that lands.
+#[allow(dead_code)]
+pub(crate) async fn group_key_at(
+    local_hgk: &KeyMaterial,
+    fgk_ordinal: u64,
+    reader: &dyn OperationReader,
+) -> Result<KeyMaterial, KeyManagerError> {
+    let derivation = Derivation::default();
+
+    let chain = reconstruct_live_chain(reader).await?;
+    let node_index = chain
+        .iter()
+        .position(|node| node.fgk_ordinal == fgk_ordinal)
+        .ok_or(KeyManagerError)?;
+
+    // Walk GB chain from the current HGK down to the target node.
+    let current_hgk = resolve_current_hgk(local_hgk, reader).await?;
+    let mut gb_key = current_hgk;
+
+    for node in &chain[..node_index] {
+        let pair = load_gbct_row(reader, node.fgk_ordinal, false).await?;
+        let ct = pair
+            .older_gb_key_ciphertext
+            .as_ref()
+            .ok_or(KeyManagerError)?;
+        let enc_key = derivation.derive(&gb_key, tag(GB_CHAIN_LINK_TAG));
+        gb_key = ct.decrypt(enc_key);
+    }
+
+    Ok(gb_key)
+}
+
 /// Validate the storage shape for SimpleLine2.
 ///
 /// Checks structural invariants: non-empty FGK/D tables, strictly
