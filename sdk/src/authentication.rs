@@ -29,6 +29,26 @@ impl Space {
         self.authenticate(AuthContext::new(Some(user_id), self.id))
             .await
     }
+
+    /// Send an ephemeral frame while claiming an arbitrary `uid`, bypassing
+    /// the production [`Space::send_ephemeral`]'s honest-uid derivation
+    /// (which always stamps `uid` from this space's own `auth_context`).
+    ///
+    /// Test-only: exists so tests can simulate a malicious/buggy client that
+    /// lies about its identity in a presence/typing/voice-signaling
+    /// ephemeral message, and assert the server does not trust it. The
+    /// server's dispatch (`backend/server/src/websocket.rs`) always
+    /// overwrites `Ephemeral.uid` with the connection's server-verified uid
+    /// before relaying (or drops the frame if the connection never
+    /// verified), so a forged uid sent through here must never reach other
+    /// clients unmodified — see `sdk/tests/ephemeral_uid_probe.rs`.
+    ///
+    /// Gated the same way as the production `Space::send_ephemeral` it
+    /// shadows (`Transport::send_ephemeral` itself is native-only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn send_ephemeral_as_uid(&self, uid: u32, kind: &str, payload: &[u8]) -> Result<()> {
+        self.transport.send_ephemeral(uid, kind, payload).await
+    }
 }
 
 impl Space {

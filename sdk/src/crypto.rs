@@ -487,6 +487,68 @@ mod tests {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // `Space::voice_root` — the voice media plane's channel subtree key.
+    // Same underlying derivation `invite_user_scoped` delivers (§4.3);
+    // exercised here (rather than in `users.rs`) because this module
+    // already carries the full-member/scoped-member `Space` harness.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn full_member_voice_root_matches_derived_channel_key() -> Result<()> {
+        let (_, space) = create_space().await?;
+
+        // Ground truth: the exact lock/space_key/channel_subtree_key sequence
+        // `invite_user_scoped` uses to derive a channel's subtree key for
+        // delivery. `voice_root` must expose precisely this value.
+        let expected_ch1 = {
+            let km = space.key_manager.lock().await;
+            km.space_key()
+                .channel_subtree_key(1)
+                .expect("a full member derives every channel's subtree key")
+        };
+
+        let root1 = space.voice_root(1).await;
+        assert_eq!(
+            root1,
+            Some(expected_ch1),
+            "voice_root(1) must equal the channel's derived subtree key"
+        );
+
+        // A different channel must derive a different root (the channel id is
+        // mixed into the derivation, not ignored).
+        let root2 = space.voice_root(2).await;
+        assert_ne!(
+            root1, root2,
+            "different channels must derive different voice roots"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_member_voice_root_is_none_even_for_a_delivered_channel() -> Result<()> {
+        let (transport, alice) = create_space().await?;
+
+        // Agent scoped to channel 1 only — it joins holding a *delivered*
+        // channel-1 subtree key, never the group key.
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let agent = crate::Space::join(transport.clone(), invite, schema()).await?;
+
+        // `voice_root` derives from the group key (mirrors
+        // `channel_subtree_key`'s full-member-only contract) — a scoped
+        // member holds no group key, so it gets `None` for every channel,
+        // even the one it was granted delivered read access to.
+        assert_eq!(
+            agent.voice_root(1).await,
+            None,
+            "a scoped member cannot derive — only a full member can"
+        );
+        assert_eq!(agent.voice_root(2).await, None);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn any_channel_derives_without_setup() -> Result<()> {
         let (_, space) = create_space().await?;

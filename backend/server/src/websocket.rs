@@ -411,8 +411,30 @@ async fn dispatch_frame(frame: WsFrame, state: &mut ConnectionState) {
                 state.space_id
             );
         }
-        Some(ws_frame::Payload::Ephemeral(e)) => {
-            relay_ephemeral(&e, &state.conn_registry, state.space_id).await;
+        Some(ws_frame::Payload::Ephemeral(mut e)) => {
+            // Server-attested uid (Task C1): overwrite, never trust the
+            // client-asserted `Ephemeral.uid`. A forged uid is silently
+            // corrected to the connection's own server-verified uid — this
+            // is strictly safer than rejecting, since rejecting would let a
+            // malicious client's bad frame also drop what would otherwise be
+            // a legitimate relay for an honest sender sharing the
+            // connection. Honest clients (who already stamp their own real
+            // uid, e.g. `Space::send_ephemeral`) see no behavior change.
+            // Gate: an unverified/bootstrap connection (`verified_uid ==
+            // None`) may not relay ephemeral frames at all — mirror the
+            // DbRequest verified-connection gate above (~line 322).
+            match state.verified_uid {
+                Some(uid) => {
+                    e.uid = uid as u32;
+                    relay_ephemeral(&e, &state.conn_registry, state.space_id).await;
+                }
+                None => {
+                    log::warn!(
+                        "space={} ws: dropping ephemeral frame on unverified connection",
+                        state.space_id
+                    );
+                }
+            }
         }
         Some(ws_frame::Payload::ChallengeNonce(_))
         | Some(ws_frame::Payload::ChallengeResponse(_)) => {
