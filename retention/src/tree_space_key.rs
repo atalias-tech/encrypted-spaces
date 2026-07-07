@@ -137,9 +137,20 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
     /// historical-read resolver. Full-member reads of a channel row written
     /// under a PAST epoch instead recover that epoch's group key via
     /// `SimpleLine2SpaceKey::group_key_at`'s §4.2 encryption-edge walk
-    /// (`TreeSpaceKey::data_key_for_key_id`). Delivering a scoped member's
-    /// PAST epochs (so it retains history across a rekey, not just the
-    /// current grant) is a separate, tracked follow-up.
+    /// (`TreeSpaceKey::data_key_for_key_id`).
+    ///
+    /// The caller (`sdk`'s `invite_user_scoped`) tags this key with the SAME
+    /// current epoch (via [`Self::current_channel_epoch`]) on the delivery
+    /// envelope (`ChannelDeliveryRequest::epoch`), so the recipient installs
+    /// it at the epoch it actually derives from
+    /// (`TreeSpaceKey::install_channel_key`) rather than inferring one —
+    /// closing the epoch-indexed channel-keys design's install-time race.
+    /// Delivering a scoped member a PAST epoch on demand (e.g. backfill after
+    /// it missed several rekeys) is possible by combining
+    /// [`Self::channel_grant_for_group_key`] with
+    /// [`SimpleLine2SpaceKey::group_key_at`], but no call site does this
+    /// today — a scoped member's holdings only grow forward, one epoch per
+    /// grant/regrant it actually receives.
     pub fn channel_subtree_key(&self, channel: i64) -> Option<KeyMaterial> {
         self.group
             .as_ref()
@@ -245,21 +256,22 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
     /// `_retention` FGK/D bookkeeping backing the live chain is plaintext
     /// (`internal_schemas.kdl`), not gated behind the group key.
     ///
-    /// Used at delivery-*install* time: a scoped member tags a
-    /// freshly-delivered channel key with the epoch it was derived under
-    /// (`sdk`'s `install_scoped_channels_verified`), so a later read's
-    /// `(channel, epoch)` lookup matches what a full member independently
-    /// stamps via [`SimpleLine2SpaceKey::current_epoch`] at write time.
+    /// No longer used at delivery-*install* time (that INTERIM inference —
+    /// tagging a delivered key with whatever epoch local storage reports as
+    /// "current" — has been replaced by reading the epoch straight off the
+    /// delivery envelope itself, `ScopedChannelDelivery::epoch`, which is
+    /// always correct regardless of the recipient's local sync state or how
+    /// many rekeys it skipped between refreshes).
     ///
-    /// INTERIM caveat: this infers "current" from storage NOW rather than
-    /// from a value carried explicitly on the delivery payload. A recipient
-    /// that installs after MULTIPLE further rekeys landed (having skipped
-    /// intermediate `refresh_scoped_keys` calls) could mis-tag a delivery
-    /// with a too-new epoch. Tracked follow-up: thread the real epoch
-    /// through `ScopedChannelDelivery` itself to remove this race. Not a
-    /// regression versus the prior placeholder (every install used the
-    /// fixed epoch 0 regardless of the delivery's actual epoch); strictly
-    /// more correct for the common single-rekey-then-refresh case.
+    /// Used instead at delivery-*build* time on the SENDING side: `sdk`'s
+    /// `Space::rekey` / `remove_user` call this, via read-your-writes on the
+    /// SAME `OperationBuilder` just passed to `generate_group_key` (which
+    /// appends the new FGK row as a pending write before this reads it back,
+    /// and BEFORE `finalize()` consumes the builder), to learn the epoch the
+    /// just-generated new group key was assigned — the ground truth to stamp
+    /// on that rekey's scoped-member channel re-deliveries
+    /// (`build_scoped_regrants`'s `new_epoch` parameter), rather than
+    /// assuming "current + 1".
     pub async fn live_chain_current_epoch(
         reader: &dyn OperationReader,
     ) -> Result<u64, KeyManagerError> {
@@ -500,7 +512,7 @@ mod tests {
         // Full member derives channel 1's subtree key and mVE-wraps it to B.
         let subtree = full.channel_subtree_key(1).unwrap();
         let commitment = DerivationKoalaBearPoseidon2_16::default().commit(&subtree);
-        let req = prove_channel_delivery(1, commitment, &subtree, &[b_kp.public().clone()]);
+        let req = prove_channel_delivery(1, 0, commitment, &subtree, &[b_kp.public().clone()]);
         let cts = verify_channel_delivery(&[b_kp.public().clone()], &req).unwrap();
         let b_ct = cts.get(0).unwrap();
         let delivered =
@@ -559,6 +571,82 @@ mod tests {
 
         assert_eq!(scoped.channel_keys.get(&(5, 1)), Some(&key_a));
         assert_eq!(scoped.channel_keys.get(&(5, 2)), Some(&key_b));
+    }
+
+    /// Task 4: demonstrates exactly why a scoped member's delivered channel
+    /// key must be tagged with the epoch it was ACTUALLY derived under
+    /// (carried on the delivery envelope, `ScopedChannelDelivery::epoch`),
+    /// rather than the "current epoch" inferred from local storage at
+    /// install time (`live_chain_current_epoch`) — the Task 3 interim's
+    /// approach before this task threaded the real epoch through the
+    /// delivery payload.
+    ///
+    /// Storage advances two epochs (E1 -> E2 -> E3) after a channel key was
+    /// derived under E1. Tagging that E1-derived key with whatever storage
+    /// reports as "current" at a LATER install time mis-files it and the E1
+    /// row becomes unreadable (`MissingKey`) — exactly the interim's
+    /// documented "multi-rekey-skip race". Tagging it with its OWN epoch (0,
+    /// the fix) reproduces the E1 data key correctly regardless of how far
+    /// storage has moved on.
+    #[tokio::test]
+    async fn scoped_install_must_use_delivered_epoch_not_storage_inference() {
+        let mut mem = MemoryOperationBuilder::new();
+        let mut full: Tree = TreeSpaceKey::new(&mut mem).await.unwrap();
+
+        // E1 (epoch 0): derive channel 1's subtree key — what gets
+        // "delivered" to a scoped member at invite time.
+        let key_e1 = full.channel_subtree_key(1).unwrap();
+
+        // Two rekeys land: E1 -> E2 -> E3. `full`'s own local storage (and
+        // hence `live_chain_current_epoch`, which reads it directly) now
+        // reports epoch 2 as "current" — TWO epochs past where `key_e1` was
+        // derived, simulating a recipient that skipped both rekeys' refreshes.
+        for _ in 0..2 {
+            let (commitment, new_key) = full.generate_group_key(&mut mem).await.unwrap();
+            full.apply_new_group_key(new_key, commitment, &mem)
+                .await
+                .unwrap();
+        }
+        let storage_current_epoch = TreeSpaceKey::<NoProver>::live_chain_current_epoch(&mem)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage_current_epoch, 2,
+            "two rekeys land two ordinals past the genesis epoch"
+        );
+
+        // INTERIM behavior (pre-Task-4): tag the E1-derived key with whatever
+        // storage reports as current (2) at install time.
+        let mut scoped_interim: Tree = TreeSpaceKey::scoped(std::iter::empty());
+        scoped_interim.install_channel_key(1, storage_current_epoch, key_e1.clone());
+        assert!(
+            scoped_interim
+                .data_key_for_key_id(&TreeKeyId::new(1, 0), &mem)
+                .await
+                .is_err(),
+            "mis-tagging the E1 key at the storage-inferred CURRENT epoch (2) \
+             loses the E1 row — this is exactly the Task 3 interim's \
+             documented multi-rekey-skip race"
+        );
+
+        // FIX (this task): tag with the epoch the key was ACTUALLY delivered
+        // at (0, carried on `ScopedChannelDelivery::epoch`), independent of
+        // wherever local storage has since moved on to.
+        let mut scoped_fixed: Tree = TreeSpaceKey::scoped(std::iter::empty());
+        scoped_fixed.install_channel_key(1, 0, key_e1.clone());
+        let full_c1 = full
+            .data_key_for_key_id(&TreeKeyId::new(1, 0), &mem)
+            .await
+            .unwrap();
+        let scoped_c1 = scoped_fixed
+            .data_key_for_key_id(&TreeKeyId::new(1, 0), &mem)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_c1, scoped_c1,
+            "tagging at the DELIVERED epoch reproduces the E1 data key \
+             regardless of how many rekeys storage has since advanced through"
+        );
     }
 
     /// Regression: `channel_keys` is keyed by the tuple `(i64, u64)`, which

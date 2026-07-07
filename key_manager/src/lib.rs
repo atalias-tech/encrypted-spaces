@@ -387,8 +387,17 @@ pub fn verify_invite(
 /// `TreeSpaceKey::produce_channel_group_key`); this proves the same
 /// multi-recipient envelope shape a rekey uses, bound to a channel-specific
 /// session so it can't be confused with a group-key delivery.
+///
+/// `epoch` is the FGK ordinal `key` was derived under (`channel_root` of that
+/// epoch's group key) — carried into [`ChannelDeliveryRequest::epoch`] as
+/// pure payload metadata. It is NOT fed into the mVE proof below (which binds
+/// only `commitment`/`recipients`, exactly as before this field existed), so
+/// adding it changes no proof verification and requires no guest/ImageID
+/// change: the recipient uses it only to pick which local `(channel, epoch)`
+/// slot to install the decrypted key into.
 pub fn prove_channel_delivery(
     channel: i64,
+    epoch: u64,
     commitment: KeyCommitment,
     key: &KeyMaterial,
     recipients: &[<DefaultMkem as Mkem>::PublicKey],
@@ -401,6 +410,7 @@ pub fn prove_channel_delivery(
     );
     ChannelDeliveryRequest {
         channel,
+        epoch,
         commitment,
         proof,
     }

@@ -57,9 +57,11 @@ pub(super) fn channel_grant_tag(channel: i64) -> DerivationTag {
 /// [`channel_root`]). Convenience for callers building
 /// `ChannelGrantVerifyInput`/`ChannelGrantProofInput` so they don't need to
 /// re-derive and commit the channel key inline.
-// No non-test caller yet: consumed by the L2 Part B scoped-invite grant
-// write (plan Task 4), which builds the ChannelGrant proof inputs at the
-// grant-write site. Remove the allow when that lands.
+// Still no non-test caller: the epoch-indexed channel-keys work (grant/
+// delivery call sites in `sdk`'s `invite_user_scoped` / `build_scoped_regrants`)
+// ended up deriving the commitment inline (`derivation.commit(&subtree)`)
+// rather than through this helper, matching the pre-existing call-site
+// pattern. Left in place as a documented convenience for a future caller.
 #[allow(dead_code)]
 pub(crate) fn channel_grant_commitment(group_key: &KeyMaterial, channel: i64) -> KeyCommitment {
     let derivation = Derivation::default();

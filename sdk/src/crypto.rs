@@ -1234,6 +1234,171 @@ mod tests {
         Ok(())
     }
 
+    /// Task 4 regression gate (epoch-indexed channel-key DELIVERY): the crown
+    /// jewels above only assert a scoped member reads NEW messages after a
+    /// rekey. This asserts the missing half — a scoped member must RETAIN
+    /// read access to a channel row written BEFORE a rekey, via the retained
+    /// per-`(channel, epoch)` key Part B re-delivery accumulates (Task 2's
+    /// `install_channel_key` retains prior epochs; this task tags each
+    /// install with the epoch the key was ACTUALLY delivered at, carried on
+    /// `ScopedChannelDelivery::epoch`, rather than inferring one locally).
+    ///
+    /// Mirrors the full-member version
+    /// (`full_member_reads_pre_rekey_channel_row_after_rekey`), for scoped
+    /// members. A member never granted the channel still gets nothing for
+    /// it (`MissingKey`, silently dropped from the result set) — Part A's
+    /// read-scoping boundary must not be disturbed by retaining history.
+    #[tokio::test]
+    async fn scoped_member_retains_pre_rekey_channel_row_after_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Alice writes a channel-1 ("general") row under E1 (genesis epoch),
+        // BEFORE Charlie is even invited.
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "e1-general-secret".into(),
+            })
+            .execute()
+            .await?;
+
+        // Charlie: scoped to channel 1 only. Dave: scoped to channel 2 only —
+        // never granted channel 1, the Part A exclusion this test also checks.
+        let charlie_invite = alice.invite_user_scoped(&[1]).await?;
+        let charlie = crate::Space::join(transport.clone(), charlie_invite, schema()).await?;
+        charlie.register_table_schema(msgs_schema()?);
+        let dave_invite = alice.invite_user_scoped(&[2]).await?;
+        let dave = crate::Space::join(transport.clone(), dave_invite, schema()).await?;
+        dave.register_table_schema(msgs_schema()?);
+
+        // Sanity, pre-rekey: Charlie reads the E1 row; Dave does not.
+        let charlie_before: Vec<Msg> = charlie.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            charlie_before.iter().any(|m| m.body == "e1-general-secret"),
+            "Charlie must read the E1 channel-1 row before any rekey"
+        );
+        let dave_before: Vec<Msg> = dave.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            dave_before.is_empty(),
+            "Dave (scoped to channel 2 only) must never see channel 1"
+        );
+
+        // Founder rekeys (E1 -> E2): Part B re-derives + re-delivers every
+        // surviving scoped member's channel keys against the NEW epoch.
+        alice.recover_via_fast_forward().await?;
+        alice.rekey().await?;
+
+        // Both scoped members refresh: Charlie's install RETAINS the E1 key
+        // (Task 2) tagged at the epoch it was ACTUALLY delivered at (this
+        // task) alongside the freshly delivered E2 key.
+        charlie.refresh_scoped_keys().await?;
+        dave.refresh_scoped_keys().await?;
+
+        // THE regression: Charlie still reads the E1 row AFTER the rekey —
+        // this fails (row silently dropped, `MissingKey`) on the pre-Task-4
+        // channel-key model, where a rekey clobbers (or, under the Task 3
+        // interim, may mis-tag) the retained key instead of accumulating a
+        // correctly-tagged one per epoch.
+        let charlie_after: Vec<Msg> = charlie.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            charlie_after.iter().any(|m| m.body == "e1-general-secret"),
+            "scoped member must retain read access to a PRE-rekey channel row \
+             after a rekey, via its retained per-epoch channel key"
+        );
+
+        // Dave (never granted channel 1) still gets nothing for it, even
+        // after a rekey re-delivery round — retaining history must not
+        // re-open the Part A read-scoping boundary.
+        let dave_after: Vec<Msg> = dave.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            dave_after.is_empty(),
+            "a member never granted channel 1 must still get MissingKey for \
+             its rows after a rekey"
+        );
+
+        Ok(())
+    }
+
+    /// Task 4 regression gate, multi-rekey depth + "skipped refresh" variant:
+    /// Charlie does NOT refresh between TWO rekeys (E1 -> E2 -> E3) — only
+    /// once, after both have landed — and must still retain the E1 row AND
+    /// read the NEW E3 row. This is the scenario the Task 3 interim's
+    /// docstring names as its "multi-rekey-skip race" (a recipient that
+    /// installs after skipping several rekeys' worth of refreshes must get
+    /// its epoch tag from the delivery envelope, not from local state that
+    /// may have moved on): every install below is tagged from
+    /// `ScopedChannelDelivery::epoch`, so correctness does not depend on how
+    /// many rekeys were skipped between refreshes, nor on the recipient's
+    /// local sync state at install time.
+    #[tokio::test]
+    async fn scoped_member_retains_pre_rekey_channel_row_after_skipped_multi_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "e1-general-secret".into(),
+            })
+            .execute()
+            .await?;
+
+        let invite = alice.invite_user_scoped(&[1]).await?;
+        let charlie = crate::Space::join(transport.clone(), invite, schema()).await?;
+        charlie.register_table_schema(msgs_schema()?);
+
+        // TWO rekeys land (E1 -> E2 -> E3) with NO refresh in between —
+        // Charlie's slot is re-derived + re-deposited by both (Part B), but
+        // Charlie never processes the intermediate (E2) envelope.
+        alice.recover_via_fast_forward().await?;
+        alice.rekey().await?; // E1 -> E2
+        alice.recover_via_fast_forward().await?;
+        alice.rekey().await?; // E2 -> E3
+
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "e3-general-secret".into(),
+            })
+            .execute()
+            .await?;
+
+        // ONE catch-up refresh after skipping both intermediate rekeys.
+        charlie.refresh_scoped_keys().await?;
+
+        let rows: Vec<Msg> = charlie.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "e1-general-secret"),
+            "Charlie must retain the E1 row across TWO skipped rekeys"
+        );
+        assert!(
+            rows.iter().any(|m| m.body == "e3-general-secret"),
+            "Charlie must read the NEW E3 row after the single catch-up refresh"
+        );
+        Ok(())
+    }
+
     /// L2 Part B defect fix: a scoped `refresh_scoped_keys` must SKIP a delivery
     /// envelope it has already consumed, not re-process it.
     ///
@@ -1364,13 +1529,19 @@ mod tests {
         // accept it), wrapped to the agent's real update key.
         let wrong_key = KeyMaterial::digest(b"attacker-substituted-channel-key");
         let wrong_commitment = DerivationKoalaBearPoseidon2_16::default().commit(&wrong_key);
-        let req =
-            prove_channel_delivery(1, wrong_commitment, &wrong_key, std::slice::from_ref(&agent_pk));
+        let req = prove_channel_delivery(
+            1,
+            0,
+            wrong_commitment,
+            &wrong_key,
+            std::slice::from_ref(&agent_pk),
+        );
         let cts = verify_channel_delivery(std::slice::from_ref(&agent_pk), &req)
             .expect("bogus delivery is a well-formed mVE");
         let bogus = ScopedDeliveryEnvelope {
             channels: vec![ScopedChannelDelivery {
                 channel: 1,
+                epoch: 0,
                 binding_commitment: wrong_commitment,
                 ciphertext: cts.get(0).unwrap().clone(),
             }],
@@ -1460,13 +1631,19 @@ mod tests {
             .key_manager()
             .rekey_with_group_key(&remaining_pks, &mut rekey_builder)
             .await?;
+        let new_epoch = encrypted_spaces_retention::tree_space_key::TreeSpaceKey::<
+            encrypted_spaces_retention::simple_line2::DefaultProver,
+        >::live_chain_current_epoch(&rekey_builder)
+        .await
+        .expect("resolve new rekey epoch");
         let rekey_output = rekey_builder.finalize();
         let mut retention_writes = rekey_output.writes;
         let retention_proofs = rekey_output.proofs;
 
         // Honest re-grants: refresh the agent's channel 1 against the new epoch.
-        let (mut scoped_regrants, mut grant_writes) =
-            alice.build_scoped_regrants(&new_group_key, None).await?;
+        let (mut scoped_regrants, mut grant_writes) = alice
+            .build_scoped_regrants(&new_group_key, new_epoch, None)
+            .await?;
 
         // ATTACK: forge an extra re-grant for channel 2 — a channel the agent
         // was NEVER granted — plus a matching channel-grant `_retention` row,
@@ -1490,6 +1667,7 @@ mod tests {
         let commitment = derivation.commit(&subtree);
         let delivery = prove_channel_delivery(
             UNGRANTED_CH,
+            new_epoch,
             commitment,
             &subtree,
             std::slice::from_ref(&agent_pk),

@@ -83,6 +83,23 @@ pub struct InviteResult {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ChannelDeliveryRequest {
     pub channel: i64,
+    /// The epoch (FGK ordinal) `channel_root(group_key_at(epoch), channel)`
+    /// was derived under — so the recipient installs the delivered key at
+    /// the epoch it ACTUALLY belongs to (`TreeSpaceKey::install_channel_key`),
+    /// rather than inferring "current" from its own possibly-stale local
+    /// state (the epoch-indexed channel-keys design's closed race).
+    ///
+    /// Pure delivery **metadata**, like `channel` above: the mVE proof below
+    /// binds `commitment`/`recipients` only (see `prove_channel_delivery`),
+    /// not `epoch`, so this field carries no cryptographic weight of its own
+    /// — a wrong value can only misfile the delivered key locally (denying
+    /// that epoch's read), never leak or corrupt anything, exactly like a
+    /// wrong `channel` value already could (see `ScopedChannelDelivery`'s
+    /// doc). The value is trusted from the same source `channel` already is:
+    /// the full member driving the grant (invite/rekey), which is bound by
+    /// the §4.3 channel-grant derivation proof for its COMMITMENT+CHANNEL,
+    /// but not (and does not need to be) for this epoch tag.
+    pub epoch: u64,
     pub commitment: KeyCommitment,
     pub proof: PoseidonMveProof<DefaultMkem>,
 }
@@ -109,6 +126,11 @@ pub struct ScopedInviteRequest {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScopedChannelDelivery {
     pub channel: i64,
+    /// The epoch this delivered key was derived under — relayed verbatim
+    /// from the verified [`ChannelDeliveryRequest::epoch`] the server
+    /// checked before depositing this envelope. See that field's doc for why
+    /// this rides as payload metadata rather than proof-bound state.
+    pub epoch: u64,
     pub binding_commitment: KeyCommitment,
     pub ciphertext: MveRecipientCiphertext<DefaultMkem, KeyMaterial>,
 }

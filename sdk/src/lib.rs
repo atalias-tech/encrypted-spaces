@@ -786,28 +786,17 @@ impl Space {
             verified.push((i, anchored));
         }
 
-        // Epoch to tag installed keys with: the live chain's current FGK
-        // ordinal, read straight from the (plaintext) `_retention` bookkeeping
-        // — no group key needed (see `TreeSpaceKey::live_chain_current_epoch`).
-        // TODO(Task 4 — epoch-indexed channel keys): this infers "current"
-        // from storage at install time rather than a value carried explicitly
-        // on `ScopedChannelDelivery`; a recipient that skips several rekeys'
-        // worth of refreshes before installing could mis-tag a delivery with
-        // a too-new epoch. Thread the real epoch through the delivery payload
-        // to remove this race. Strictly more correct than the prior fixed
-        // placeholder `0` (which ignored the actual epoch entirely) for the
-        // common single-rekey-then-refresh case.
-        let epoch_reader = self.retention_builder();
-        let install_epoch =
-            TreeSpaceKey::<encrypted_spaces_retention::simple_line2::DefaultProver>::live_chain_current_epoch(
-                &epoch_reader,
-            )
-            .await
-            .unwrap_or(0);
-
         // Phase 2 (key-manager lock): decrypt against the ANCHORED commitment
         // (not the envelope's) and install. A ciphertext that does not decrypt
         // to the anchored key fails here and is skipped.
+        //
+        // Installed at `ch.epoch` — the epoch this key was ACTUALLY derived
+        // under, carried on the delivery envelope itself
+        // (`ScopedChannelDelivery::epoch`) — not inferred from local storage.
+        // This closes the epoch-indexed channel-keys design's install-time
+        // race (a recipient that skipped several rekeys' worth of refreshes
+        // before installing could otherwise mis-tag a delivery with whatever
+        // epoch its local state happened to report as "current").
         let mut km = self.key_manager.lock().await;
         let mut installed = 0usize;
         for (i, anchored) in verified {
@@ -815,7 +804,7 @@ impl Space {
             match km.decrypt_delivered_key(&ch.ciphertext, anchored) {
                 Ok(key) => {
                     km.space_key_mut()
-                        .install_channel_key(ch.channel, install_epoch, key);
+                        .install_channel_key(ch.channel, ch.epoch, key);
                     installed += 1;
                 }
                 Err(_) => {

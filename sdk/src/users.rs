@@ -10,6 +10,8 @@ use encrypted_spaces_crypto::pke::{KemKeyPair, XWingRistretto};
 use encrypted_spaces_crypto::signature::SignatureKeyPair;
 use encrypted_spaces_crypto::{default_rng, Mkem, Signature};
 use encrypted_spaces_key_manager::{DefaultMkem, DefaultSignature, InviteRequest};
+use encrypted_spaces_retention::simple_line2::DefaultProver;
+use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A representation of a user record, with secret key material
@@ -393,6 +395,7 @@ impl Space {
         //    grant `_retention` write. The grant commitment == the mVE
         //    `binding_commitment` == `commit(subtree key)`, so the committed
         //    grant record is exactly the delivered key.
+        let epoch_reader = self.retention_builder();
         let (scoped_request, grant_writes) = {
             let km = self.key_manager.lock().await;
             let tree = km.space_key();
@@ -406,6 +409,18 @@ impl Space {
                         "only a full member can issue a scoped invite".into(),
                     )
                 })?;
+                // The epoch `subtree` was just derived under (the CURRENT
+                // group key's FGK ordinal) — tags the delivery so the
+                // recipient installs at this exact epoch instead of
+                // inferring one locally (the epoch-indexed channel-keys fix).
+                let epoch = tree
+                    .current_channel_epoch(ch, &epoch_reader)
+                    .await
+                    .map_err(|_| {
+                        SdkError::ValidationError(
+                            "failed to resolve current channel epoch for scoped invite".into(),
+                        )
+                    })?;
                 let commitment = derivation.commit(&subtree);
                 let grant_proof = tree.prove_channel_grant(ch).ok_or_else(|| {
                     SdkError::ValidationError(
@@ -414,6 +429,7 @@ impl Space {
                 })?;
                 reqs.push(prove_channel_delivery(
                     ch,
+                    epoch,
                     commitment,
                     &subtree,
                     std::slice::from_ref(&new_pk),
@@ -530,6 +546,16 @@ impl Space {
             .key_manager()
             .rekey_with_group_key(&recipient_pks, &mut rekey_builder)
             .await?;
+        // Learn the epoch this rekey just assigned `new_group_key`, via
+        // read-your-writes on the SAME builder `rekey_with_group_key` just
+        // wrote the new FGK row to — BEFORE `finalize()` below consumes it.
+        // Ground truth for tagging surviving scoped members' re-deliveries
+        // (no "current + 1" guesswork).
+        let new_epoch = TreeSpaceKey::<DefaultProver>::live_chain_current_epoch(&rekey_builder)
+            .await
+            .map_err(|_| {
+                SdkError::ValidationError("failed to resolve new rekey epoch".to_string())
+            })?;
         let rekey_output = rekey_builder.finalize();
         let mut rekey_retention_writes = rekey_output.writes;
         let rekey_proofs = rekey_output.proofs;
@@ -541,7 +567,7 @@ impl Space {
         //     re-deposited as fresh ScopedDeliveryEnvelopes). The removed user
         //     is excluded — it is not re-granted and its slot is still cleared.
         let (scoped_regrants, grant_writes) = self
-            .build_scoped_regrants(&new_group_key, Some(user_id))
+            .build_scoped_regrants(&new_group_key, new_epoch, Some(user_id))
             .await?;
         delete_request.scoped_regrants = scoped_regrants;
         rekey_retention_writes.extend(grant_writes);
@@ -653,9 +679,18 @@ impl Space {
     ///
     /// Mirrors the scoped-invite triple-build in [`Self::invite_user_scoped`],
     /// but derives against the freshly generated (not-yet-installed) group key.
+    ///
+    /// `new_epoch` is the FGK ordinal the rekey just assigned `new_group_key`
+    /// (the caller reads it via `TreeSpaceKey::live_chain_current_epoch` on
+    /// the SAME builder that generated the new group key, before
+    /// `finalize()` — see `Space::rekey` / `Space::remove_user`). Every
+    /// channel re-delivered here is tagged with this epoch, so surviving
+    /// scoped members install it at the epoch it actually derives from
+    /// rather than inferring one locally.
     pub(crate) async fn build_scoped_regrants(
         &self,
         new_group_key: &encrypted_spaces_crypto::KeyMaterial,
+        new_epoch: u64,
         removed_uid: Option<i64>,
     ) -> Result<
         (
@@ -729,8 +764,13 @@ impl Space {
                         )
                     })?;
                 let commitment = derivation.commit(&subtree);
-                let delivery =
-                    prove_channel_delivery(ch, commitment, &subtree, std::slice::from_ref(pk));
+                let delivery = prove_channel_delivery(
+                    ch,
+                    new_epoch,
+                    commitment,
+                    &subtree,
+                    std::slice::from_ref(pk),
+                );
                 ch_regrants.push(ChannelRegrant {
                     delivery,
                     grant_proof,
