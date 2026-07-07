@@ -3210,6 +3210,7 @@ impl SpaceState {
             })?;
             deliveries.push(ScopedChannelDelivery {
                 channel: ch_req.channel,
+                epoch: ch_req.epoch,
                 binding_commitment: ch_req.commitment,
                 ciphertext: ciphertext.clone(),
             });
@@ -3867,6 +3868,7 @@ impl SpaceState {
                 }
                 deliveries.push(ScopedChannelDelivery {
                     channel,
+                    epoch: cr.delivery.epoch,
                     binding_commitment: cr.delivery.commitment,
                     ciphertext: ciphertext.clone(),
                 });

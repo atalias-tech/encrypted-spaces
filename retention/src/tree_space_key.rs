@@ -29,8 +29,8 @@ use encrypted_spaces_key_manager::{
 use serde::{Deserialize, Serialize};
 
 use crate::simple_line2::{
-    ChannelGrantProofInput, ChannelGrantVerifyInput, DefaultDerivation, DefaultProver,
-    SimpleLine2RuntimeProver, SimpleLine2SpaceKey,
+    reconstruct_live_chain, ChannelGrantProofInput, ChannelGrantVerifyInput, DefaultDerivation,
+    DefaultProver, SimpleLine2RuntimeProver, SimpleLine2SpaceKey,
 };
 use crate::tree_keys::{channel_data_key, channel_root, TreeKeyId};
 
@@ -42,10 +42,55 @@ pub struct TreeSpaceKey<P: SimpleLine2RuntimeProver = DefaultProver> {
     /// Group-key tier (§4.2): group key + temporal chain + rekey. `Some` for a
     /// full member (which derives every channel); `None` for a scoped member.
     group: Option<SimpleLine2SpaceKey<P>>,
-    /// Delivered channel subtree keys (§4.3) — the channels a scoped member may
-    /// read. Empty for a full member (it derives channels from `group`).
-    #[serde(default)]
-    channel_keys: HashMap<i64, KeyMaterial>,
+    /// Delivered channel subtree keys (§4.3) — the channels (and epochs) a
+    /// scoped member may read, keyed by `(channel, epoch)` so a rekey that
+    /// re-derives a channel's key does not evict the still-valid key for a
+    /// prior epoch's rows (a scoped member retains read access to history it
+    /// was already granted). Empty for a full member (it derives channels
+    /// from `group`, walking whichever epoch it needs).
+    ///
+    /// `#[serde(with = "channel_keys_serde")]`: `serde_json` only allows
+    /// primitive (int/string/bool/char) map keys, so the tuple key
+    /// `(i64, u64)` cannot be serialized as a JSON object key directly — this
+    /// is exactly the snapshot/restore persistence path (`KeyManager` /
+    /// `Space::snapshot()` / `Space::restore()`), which any scoped member
+    /// (e.g. an L2 agent) with >=1 delivered channel key hits. Instead we
+    /// (de)serialize the map as a `Vec<((i64, u64), KeyMaterial)>` — a JSON
+    /// *array*, where the tuple is a sequence element (fine for serde_json),
+    /// not a map key.
+    #[serde(default, with = "channel_keys_serde")]
+    channel_keys: HashMap<(i64, u64), KeyMaterial>,
+}
+
+/// (De)serializes `HashMap<(i64, u64), KeyMaterial>` as a JSON array of
+/// `((i64, u64), KeyMaterial)` pairs, since `serde_json` cannot use a tuple
+/// as a map key. See the `channel_keys` field doc for why this exists.
+mod channel_keys_serde {
+    use std::collections::HashMap;
+
+    use encrypted_spaces_crypto::KeyMaterial;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(
+        map: &HashMap<(i64, u64), KeyMaterial>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<(&(i64, u64), &KeyMaterial)> = map.iter().collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<(i64, u64), KeyMaterial>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<((i64, u64), KeyMaterial)>::deserialize(deserializer)?;
+        Ok(entries.into_iter().collect())
+    }
 }
 
 impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
@@ -57,9 +102,11 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         })
     }
 
-    /// Construct a **scoped** member holding only the given channel keys (no
-    /// group key). Reads are cryptographically limited to these channels.
-    pub fn scoped(channel_keys: impl IntoIterator<Item = (i64, KeyMaterial)>) -> Self {
+    /// Construct a **scoped** member holding only the given `(channel, epoch)`
+    /// keys (no group key). Reads are cryptographically limited to these
+    /// channels, and within a channel, to the epochs whose keys were
+    /// delivered.
+    pub fn scoped(channel_keys: impl IntoIterator<Item = ((i64, u64), KeyMaterial)>) -> Self {
         Self {
             group: None,
             channel_keys: channel_keys.into_iter().collect(),
@@ -71,19 +118,39 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         self.group.is_some()
     }
 
-    /// The explicit channel set a scoped member holds (empty for a full member).
+    /// The explicit channel set a scoped member holds (empty for a full
+    /// member) — distinct channels, collapsing multiple retained epochs of
+    /// the same channel into one entry.
     pub fn scoped_channels(&self) -> Vec<i64> {
-        self.channel_keys.keys().copied().collect()
+        let mut channels: Vec<i64> = self.channel_keys.keys().map(|(c, _)| *c).collect();
+        channels.sort_unstable();
+        channels.dedup();
+        channels
     }
 
     /// Derive a channel's subtree key from the current group key, for delivery
     /// to a scoped member (§4.3). Full members only (`None` for a scoped member,
     /// which holds no group key).
     ///
-    /// Derived from the *current* group key (epoch). Reading a channel's data
-    /// written under a previous group key (before a rekey) requires recovering
-    /// that epoch's group key via the §4.2 encryption-edge chain — a tracked
-    /// follow-up; not needed within an epoch.
+    /// Derived from the *current* group key (epoch) only — this is the
+    /// delivery-time key handed to a scoped member for `channel`, not a
+    /// historical-read resolver. Full-member reads of a channel row written
+    /// under a PAST epoch instead recover that epoch's group key via
+    /// `SimpleLine2SpaceKey::group_key_at`'s §4.2 encryption-edge walk
+    /// (`TreeSpaceKey::data_key_for_key_id`).
+    ///
+    /// The caller (`sdk`'s `invite_user_scoped`) tags this key with the SAME
+    /// current epoch (via [`Self::current_channel_epoch`]) on the delivery
+    /// envelope (`ChannelDeliveryRequest::epoch`), so the recipient installs
+    /// it at the epoch it actually derives from
+    /// (`TreeSpaceKey::install_channel_key`) rather than inferring one —
+    /// closing the epoch-indexed channel-keys design's install-time race.
+    /// Delivering a scoped member a PAST epoch on demand (e.g. backfill after
+    /// it missed several rekeys) is possible by combining
+    /// [`Self::channel_grant_for_group_key`] with
+    /// [`SimpleLine2SpaceKey::group_key_at`], but no call site does this
+    /// today — a scoped member's holdings only grow forward, one epoch per
+    /// grant/regrant it actually receives.
     pub fn channel_subtree_key(&self, channel: i64) -> Option<KeyMaterial> {
         self.group
             .as_ref()
@@ -134,14 +201,85 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         Some((channel_key, proof))
     }
 
-    /// Install a delivered channel subtree key (scoped grant).
-    pub fn install_channel_key(&mut self, channel: i64, key: KeyMaterial) {
-        self.channel_keys.insert(channel, key);
+    /// Install a delivered channel subtree key for a specific epoch (scoped
+    /// grant). Retains any other epochs already held for this (or other)
+    /// channels — a rekey's re-delivery must not evict a still-valid prior
+    /// epoch's key out from under this member.
+    pub fn install_channel_key(&mut self, channel: i64, epoch: u64, key: KeyMaterial) {
+        self.channel_keys.insert((channel, epoch), key);
     }
 
-    /// Drop a channel subtree key — read revocation for this member.
+    /// Drop a channel subtree key — read revocation for this member. Removes
+    /// ALL epochs held for `channel` (revocation must not leave a stale
+    /// epoch's key behind as a back door).
     pub fn drop_channel_key(&mut self, channel: i64) {
-        self.channel_keys.remove(&channel);
+        self.channel_keys.retain(|(c, _), _| *c != channel);
+    }
+
+    /// The epoch to stamp into a freshly-written channel row's
+    /// `TreeKeyId.seq` (the write-side counterpart to
+    /// [`SpaceKey::data_key_for_key_id`]'s epoch-indexed read): so a row
+    /// encrypted now is tagged with the epoch its key actually derives from,
+    /// and stays readable by epoch after later rekeys.
+    ///
+    /// Full member: the live chain's current FGK ordinal
+    /// ([`SimpleLine2SpaceKey::current_epoch`]), read fresh from storage.
+    /// Scoped member: it holds no group key and cannot resolve a storage
+    /// epoch notion directly, so it stamps the newest epoch it has been
+    /// delivered a key for on `channel` — the freshest grant is its best
+    /// local approximation of "current" (§4.1 mVE re-delivery keeps this
+    /// current across rekeys). No delivered key for `channel` ⇒
+    /// `KeyManagerError` (cannot write to a channel it was never granted —
+    /// the write-side mirror of the read-scoping boundary).
+    pub async fn current_channel_epoch(
+        &self,
+        channel: i64,
+        reader: &dyn OperationReader,
+    ) -> Result<u64, KeyManagerError> {
+        if let Some(g) = &self.group {
+            g.current_epoch(reader).await
+        } else {
+            self.channel_keys
+                .keys()
+                .filter(|(c, _)| *c == channel)
+                .map(|&(_, epoch)| epoch)
+                .max()
+                .ok_or(KeyManagerError)
+        }
+    }
+
+    /// The live chain's current epoch (FGK ordinal), read directly from
+    /// storage — no `self` state needed. Unlike [`Self::current_channel_epoch`]
+    /// (the *write-time* accessor, which for a scoped member instead reports
+    /// the newest epoch it already holds, since it has no other way to name
+    /// "current"), this works for ANY member, full or scoped: the
+    /// `_retention` FGK/D bookkeeping backing the live chain is plaintext
+    /// (`internal_schemas.kdl`), not gated behind the group key.
+    ///
+    /// No longer used at delivery-*install* time (that INTERIM inference —
+    /// tagging a delivered key with whatever epoch local storage reports as
+    /// "current" — has been replaced by reading the epoch straight off the
+    /// delivery envelope itself, `ScopedChannelDelivery::epoch`, which is
+    /// always correct regardless of the recipient's local sync state or how
+    /// many rekeys it skipped between refreshes).
+    ///
+    /// Used instead at delivery-*build* time on the SENDING side: `sdk`'s
+    /// `Space::rekey` / `remove_user` call this, via read-your-writes on the
+    /// SAME `OperationBuilder` just passed to `generate_group_key` (which
+    /// appends the new FGK row as a pending write before this reads it back,
+    /// and BEFORE `finalize()` consumes the builder), to learn the epoch the
+    /// just-generated new group key was assigned — the ground truth to stamp
+    /// on that rekey's scoped-member channel re-deliveries
+    /// (`build_scoped_regrants`'s `new_epoch` parameter), rather than
+    /// assuming "current + 1".
+    pub async fn live_chain_current_epoch(
+        reader: &dyn OperationReader,
+    ) -> Result<u64, KeyManagerError> {
+        let chain = reconstruct_live_chain(reader).await?;
+        chain
+            .first()
+            .map(|node| node.fgk_ordinal)
+            .ok_or(KeyManagerError)
     }
 
     fn group_ref(&self) -> Result<&SimpleLine2SpaceKey<P>, KeyManagerError> {
@@ -186,12 +324,14 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> SpaceKey for TreeSpaceKey<P> {
                 .await;
         }
         // Channel row: derive the AES data key from the channel's subtree key —
-        // which a full member derives from the group key, and a scoped member
-        // holds directly (delivered). Out of scope ⇒ error (→ MissingKey).
+        // which a full member derives from the EPOCH's group key (`key_id.seq`,
+        // recovered via the §4.2 encryption-edge walk — symmetric with the root
+        // line), and a scoped member holds directly per `(channel, epoch)`
+        // (delivered). Out of scope ⇒ error (→ MissingKey).
         let subtree = if let Some(g) = &self.group {
-            let _ = reader; // group-key derivation needs no reader
-            channel_root(&g.current_group_key(), key_id.channel)
-        } else if let Some(k) = self.channel_keys.get(&key_id.channel) {
+            let gk = g.group_key_at(reader, key_id.seq).await?;
+            channel_root(&gk, key_id.channel)
+        } else if let Some(k) = self.channel_keys.get(&(key_id.channel, key_id.seq)) {
             k.clone()
         } else {
             return Err(KeyManagerError);
@@ -342,7 +482,7 @@ mod tests {
 
         // Full member derives channel 1's subtree key and "delivers" it.
         let ch1_key = full.channel_subtree_key(1).unwrap();
-        let scoped: Tree = TreeSpaceKey::scoped([(1, ch1_key)]);
+        let scoped: Tree = TreeSpaceKey::scoped([((1, 0), ch1_key)]);
 
         // Scoped reads channel 1 with the SAME key the full member derives...
         let full_c1 = full.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.unwrap();
@@ -372,14 +512,14 @@ mod tests {
         // Full member derives channel 1's subtree key and mVE-wraps it to B.
         let subtree = full.channel_subtree_key(1).unwrap();
         let commitment = DerivationKoalaBearPoseidon2_16::default().commit(&subtree);
-        let req = prove_channel_delivery(1, commitment, &subtree, &[b_kp.public().clone()]);
+        let req = prove_channel_delivery(1, 0, commitment, &subtree, &[b_kp.public().clone()]);
         let cts = verify_channel_delivery(&[b_kp.public().clone()], &req).unwrap();
         let b_ct = cts.get(0).unwrap();
         let delivered =
             PoseidonMve::<DefaultMkem>::decrypt(b_kp.secret(), &b_ct, req.commitment).unwrap();
 
         // B is a scoped member holding only the delivered channel-1 key.
-        let scoped: Tree = TreeSpaceKey::scoped([(1, delivered)]);
+        let scoped: Tree = TreeSpaceKey::scoped([((1, 0), delivered)]);
 
         // B derives the SAME channel-1 data key the full member derives...
         let full_c1 = full.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.unwrap();
@@ -394,10 +534,143 @@ mod tests {
         let mut mem = MemoryOperationBuilder::new();
         let full: Tree = TreeSpaceKey::new(&mut mem).await.unwrap();
         let ch1_key = full.channel_subtree_key(1).unwrap();
-        let mut scoped: Tree = TreeSpaceKey::scoped([(1, ch1_key)]);
+        let mut scoped: Tree = TreeSpaceKey::scoped([((1, 0), ch1_key)]);
 
         assert!(scoped.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.is_ok());
         scoped.drop_channel_key(1);
         assert!(scoped.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.is_err());
+    }
+
+    #[test]
+    fn scoped_channel_keys_are_epoch_indexed() {
+        let key_a = KeyMaterial::random();
+        let key_b = KeyMaterial::random();
+        let mut scoped: Tree =
+            TreeSpaceKey::scoped([((5, 1), key_a.clone()), ((5, 2), key_b.clone())]);
+
+        // Both epochs of channel 5 are independently retrievable.
+        assert_eq!(scoped.channel_keys.get(&(5, 1)), Some(&key_a));
+        assert_eq!(scoped.channel_keys.get(&(5, 2)), Some(&key_b));
+        // `scoped_channels` reports distinct channels, not distinct (channel, epoch) pairs.
+        assert_eq!(scoped.scoped_channels(), vec![5]);
+
+        // Dropping the channel removes ALL of its epochs, not just one.
+        scoped.drop_channel_key(5);
+        assert!(scoped.channel_keys.get(&(5, 1)).is_none());
+        assert!(scoped.channel_keys.get(&(5, 2)).is_none());
+        assert!(scoped.scoped_channels().is_empty());
+    }
+
+    #[test]
+    fn install_channel_key_retains_other_epochs() {
+        let key_a = KeyMaterial::random();
+        let key_b = KeyMaterial::random();
+        let mut scoped: Tree = TreeSpaceKey::scoped([((5, 1), key_a.clone())]);
+
+        scoped.install_channel_key(5, 2, key_b.clone());
+
+        assert_eq!(scoped.channel_keys.get(&(5, 1)), Some(&key_a));
+        assert_eq!(scoped.channel_keys.get(&(5, 2)), Some(&key_b));
+    }
+
+    /// Task 4: demonstrates exactly why a scoped member's delivered channel
+    /// key must be tagged with the epoch it was ACTUALLY derived under
+    /// (carried on the delivery envelope, `ScopedChannelDelivery::epoch`),
+    /// rather than the "current epoch" inferred from local storage at
+    /// install time (`live_chain_current_epoch`) — the Task 3 interim's
+    /// approach before this task threaded the real epoch through the
+    /// delivery payload.
+    ///
+    /// Storage advances two epochs (E1 -> E2 -> E3) after a channel key was
+    /// derived under E1. Tagging that E1-derived key with whatever storage
+    /// reports as "current" at a LATER install time mis-files it and the E1
+    /// row becomes unreadable (`MissingKey`) — exactly the interim's
+    /// documented "multi-rekey-skip race". Tagging it with its OWN epoch (0,
+    /// the fix) reproduces the E1 data key correctly regardless of how far
+    /// storage has moved on.
+    #[tokio::test]
+    async fn scoped_install_must_use_delivered_epoch_not_storage_inference() {
+        let mut mem = MemoryOperationBuilder::new();
+        let mut full: Tree = TreeSpaceKey::new(&mut mem).await.unwrap();
+
+        // E1 (epoch 0): derive channel 1's subtree key — what gets
+        // "delivered" to a scoped member at invite time.
+        let key_e1 = full.channel_subtree_key(1).unwrap();
+
+        // Two rekeys land: E1 -> E2 -> E3. `full`'s own local storage (and
+        // hence `live_chain_current_epoch`, which reads it directly) now
+        // reports epoch 2 as "current" — TWO epochs past where `key_e1` was
+        // derived, simulating a recipient that skipped both rekeys' refreshes.
+        for _ in 0..2 {
+            let (commitment, new_key) = full.generate_group_key(&mut mem).await.unwrap();
+            full.apply_new_group_key(new_key, commitment, &mem)
+                .await
+                .unwrap();
+        }
+        let storage_current_epoch = TreeSpaceKey::<NoProver>::live_chain_current_epoch(&mem)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage_current_epoch, 2,
+            "two rekeys land two ordinals past the genesis epoch"
+        );
+
+        // INTERIM behavior (pre-Task-4): tag the E1-derived key with whatever
+        // storage reports as current (2) at install time.
+        let mut scoped_interim: Tree = TreeSpaceKey::scoped(std::iter::empty());
+        scoped_interim.install_channel_key(1, storage_current_epoch, key_e1.clone());
+        assert!(
+            scoped_interim
+                .data_key_for_key_id(&TreeKeyId::new(1, 0), &mem)
+                .await
+                .is_err(),
+            "mis-tagging the E1 key at the storage-inferred CURRENT epoch (2) \
+             loses the E1 row — this is exactly the Task 3 interim's \
+             documented multi-rekey-skip race"
+        );
+
+        // FIX (this task): tag with the epoch the key was ACTUALLY delivered
+        // at (0, carried on `ScopedChannelDelivery::epoch`), independent of
+        // wherever local storage has since moved on to.
+        let mut scoped_fixed: Tree = TreeSpaceKey::scoped(std::iter::empty());
+        scoped_fixed.install_channel_key(1, 0, key_e1.clone());
+        let full_c1 = full
+            .data_key_for_key_id(&TreeKeyId::new(1, 0), &mem)
+            .await
+            .unwrap();
+        let scoped_c1 = scoped_fixed
+            .data_key_for_key_id(&TreeKeyId::new(1, 0), &mem)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_c1, scoped_c1,
+            "tagging at the DELIVERED epoch reproduces the E1 data key \
+             regardless of how many rekeys storage has since advanced through"
+        );
+    }
+
+    /// Regression: `channel_keys` is keyed by the tuple `(i64, u64)`, which
+    /// `serde_json` cannot use as a map key (only primitives — int/string/
+    /// bool/char — are allowed as JSON object keys). A scoped member with
+    /// >=1 delivered channel key must still round-trip through
+    /// `serde_json`, since that's exactly the snapshot/restore persistence
+    /// path (`KeyManager` / `Space::snapshot()` / `Space::restore()`).
+    /// Pre-fix this fails with `Error("key must be a string")`; post-fix it
+    /// round-trips both epochs.
+    #[test]
+    fn scoped_channel_keys_serde_json_round_trip() {
+        let key_a = KeyMaterial::random();
+        let key_b = KeyMaterial::random();
+        let scoped: Tree =
+            TreeSpaceKey::scoped([((5i64, 1u64), key_a.clone()), ((5, 2), key_b.clone())]);
+
+        let json = serde_json::to_value(&scoped)
+            .expect("scoped TreeSpaceKey must serialize to JSON (snapshot path)");
+        let restored: Tree = serde_json::from_value(json)
+            .expect("scoped TreeSpaceKey must deserialize from JSON (restore path)");
+
+        assert_eq!(restored.channel_keys.get(&(5, 1)), Some(&key_a));
+        assert_eq!(restored.channel_keys.get(&(5, 2)), Some(&key_b));
+        assert_eq!(restored.scoped_channels(), vec![5]);
     }
 }

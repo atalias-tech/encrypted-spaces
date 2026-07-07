@@ -190,6 +190,43 @@ async fn resolve_d_key_out_of_range() {
 }
 
 #[tokio::test]
+async fn group_key_at_fresh_state_returns_current_key() {
+    let mut builder = MemoryOperationBuilder::new();
+    let sk = TestSpaceKey::new(&mut builder).await.unwrap();
+    let key = group_key_at(&sk.hgk, 0, &builder).await.unwrap();
+    assert_eq!(key, sk.hgk);
+}
+
+#[tokio::test]
+async fn group_key_at_out_of_range_ordinal_fails() {
+    let mut builder = MemoryOperationBuilder::new();
+    let sk = TestSpaceKey::new(&mut builder).await.unwrap();
+    assert!(group_key_at(&sk.hgk, 1, &builder).await.is_err());
+}
+
+#[tokio::test]
+async fn group_key_at_recovers_past_epoch_after_rekey() {
+    let mut builder = MemoryOperationBuilder::new();
+    let mut sk = TestSpaceKey::new(&mut builder).await.unwrap();
+
+    // Epoch 1 (fgk_ordinal 0): capture the group key before rekeying.
+    let epoch1_key = sk.current_group_key();
+
+    let new_hgk = KeyMaterial::random();
+    apply_rekey(&mut sk, new_hgk, &mut builder).await;
+
+    // Epoch 2 (fgk_ordinal 1): the current group key after the rekey.
+    let epoch2_key = sk.current_group_key();
+    assert_ne!(epoch1_key, epoch2_key);
+
+    let recovered_epoch1 = group_key_at(&sk.hgk, 0, &builder).await.unwrap();
+    assert_eq!(recovered_epoch1, epoch1_key);
+
+    let recovered_epoch2 = group_key_at(&sk.hgk, 1, &builder).await.unwrap();
+    assert_eq!(recovered_epoch2, epoch2_key);
+}
+
+#[tokio::test]
 async fn validate_storage_shape_fresh_state() {
     let mut builder = MemoryOperationBuilder::new();
     let _sk = TestSpaceKey::new(&mut builder).await.unwrap();

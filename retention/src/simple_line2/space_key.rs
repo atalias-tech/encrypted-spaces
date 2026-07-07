@@ -57,9 +57,11 @@ pub(super) fn channel_grant_tag(channel: i64) -> DerivationTag {
 /// [`channel_root`]). Convenience for callers building
 /// `ChannelGrantVerifyInput`/`ChannelGrantProofInput` so they don't need to
 /// re-derive and commit the channel key inline.
-// No non-test caller yet: consumed by the L2 Part B scoped-invite grant
-// write (plan Task 4), which builds the ChannelGrant proof inputs at the
-// grant-write site. Remove the allow when that lands.
+// Still no non-test caller: the epoch-indexed channel-keys work (grant/
+// delivery call sites in `sdk`'s `invite_user_scoped` / `build_scoped_regrants`)
+// ended up deriving the commitment inline (`derivation.commit(&subtree)`)
+// rather than through this helper, matching the pre-existing call-site
+// pattern. Left in place as a documented convenience for a future caller.
 #[allow(dead_code)]
 pub(crate) fn channel_grant_commitment(group_key: &KeyMaterial, channel: i64) -> KeyCommitment {
     let derivation = Derivation::default();
@@ -254,6 +256,52 @@ pub(crate) async fn resolve_d_key(
     }
 
     Ok(d_key)
+}
+
+/// Recover the group (GB) key for a past epoch identified by `fgk_ordinal`.
+///
+/// This is the encryption-edge walk [`resolve_d_key`] performs internally
+/// (its `chain[..node_index]` loop above) to reach the GB key covering a
+/// given D sequence — extracted as a standalone primitive so epoch-indexed
+/// channel-key resolution (indexed by `fgk_ordinal`, not by D sequence) can
+/// reuse it directly instead of re-deriving the walk. Does not change
+/// `resolve_d_key`'s behavior.
+///
+/// Walks the live chain from the current HGK newest-to-oldest, decrypting
+/// each node's `older_gb_key_ciphertext` with `derive(&gb_key,
+/// tag(GB_CHAIN_LINK_TAG))`, until the node whose `fgk_ordinal` matches the
+/// target is reached, and returns that node's GB key.
+///
+/// Called via [`SimpleLine2SpaceKey::group_key_at`], the epoch-indexed
+/// channel-key read path's full-member accessor.
+pub(crate) async fn group_key_at(
+    local_hgk: &KeyMaterial,
+    fgk_ordinal: u64,
+    reader: &dyn OperationReader,
+) -> Result<KeyMaterial, KeyManagerError> {
+    let derivation = Derivation::default();
+
+    let chain = reconstruct_live_chain(reader).await?;
+    let node_index = chain
+        .iter()
+        .position(|node| node.fgk_ordinal == fgk_ordinal)
+        .ok_or(KeyManagerError)?;
+
+    // Walk GB chain from the current HGK down to the target node.
+    let current_hgk = resolve_current_hgk(local_hgk, reader).await?;
+    let mut gb_key = current_hgk;
+
+    for node in &chain[..node_index] {
+        let pair = load_gbct_row(reader, node.fgk_ordinal, false).await?;
+        let ct = pair
+            .older_gb_key_ciphertext
+            .as_ref()
+            .ok_or(KeyManagerError)?;
+        let enc_key = derivation.derive(&gb_key, tag(GB_CHAIN_LINK_TAG));
+        gb_key = ct.decrypt(enc_key);
+    }
+
+    Ok(gb_key)
 }
 
 /// Validate the storage shape for SimpleLine2.
@@ -720,6 +768,44 @@ impl<P: SimpleLine2RuntimeProver> SimpleLine2SpaceKey<P> {
     /// (channel) keys structurally, per §4.3/§5.1 (`derive(group key, path)`).
     pub fn current_group_key(&self) -> KeyMaterial {
         self.hgk.clone()
+    }
+
+    /// Recover the group key that covered epoch `fgk_ordinal` — the
+    /// full-member read-side accessor for epoch-indexed channel keys. Thin
+    /// wrapper over the module-level [`group_key_at`] using `self.hgk` as the
+    /// locally-held HGK, mirroring how [`Self::current_group_key`] exposes
+    /// `self.hgk` directly. `fgk_ordinal` is the SAME 0-indexed dense
+    /// ordinal [`Self::current_epoch`] stamps at write time — no off-by-one
+    /// between the two.
+    pub async fn group_key_at(
+        &self,
+        reader: &dyn OperationReader,
+        fgk_ordinal: u64,
+    ) -> Result<KeyMaterial, KeyManagerError> {
+        group_key_at(&self.hgk, fgk_ordinal, reader).await
+    }
+
+    /// The current epoch (FGK ordinal) — the write-side stamp for a
+    /// freshly-written channel row's `TreeKeyId.seq`, so that a later
+    /// [`Self::group_key_at`] call (at read time, possibly after further
+    /// rekeys) recovers the exact group key this row was encrypted under.
+    ///
+    /// Read fresh from storage on every call via [`reconstruct_live_chain`]
+    /// (the newest node's `fgk_ordinal`), not derived from `self.hgk` —
+    /// epoch identity is a storage-relative index (which rekey we're on),
+    /// not something the key material itself encodes. This is exactly the
+    /// ordinal `reconstruct_live_chain` places first (newest-to-oldest), and
+    /// the same ordinal `group_key_at`'s `node_index == 0` case resolves
+    /// with an empty edge-walk.
+    pub async fn current_epoch(
+        &self,
+        reader: &dyn OperationReader,
+    ) -> Result<u64, KeyManagerError> {
+        let chain = reconstruct_live_chain(reader).await?;
+        chain
+            .first()
+            .map(|node| node.fgk_ordinal)
+            .ok_or(KeyManagerError)
     }
 }
 impl<P: SimpleLine2RuntimeProver> SimpleLine2SpaceKey<P> {

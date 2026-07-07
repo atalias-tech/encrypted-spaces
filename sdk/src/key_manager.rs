@@ -7,6 +7,8 @@ use encrypted_spaces_key_manager::traits::GroupKeySync;
 use encrypted_spaces_key_manager::{
     DefaultMkem, GkDeliveryEnvelope, InviteRequest, OperationBuilder, RekeyRequest,
 };
+use encrypted_spaces_retention::simple_line2::DefaultProver;
+use encrypted_spaces_retention::tree_space_key::TreeSpaceKey;
 pub(crate) type SpacePublicKey = <DefaultMkem as Mkem>::PublicKey;
 
 /// Handle for interacting with the key manager for a Space.
@@ -90,6 +92,16 @@ impl Space {
             .key_manager()
             .rekey_with_group_key(&remaining_pks, &mut rekey_builder)
             .await?;
+        // Learn the epoch this rekey just assigned `new_group_key`, via
+        // read-your-writes on the SAME builder `rekey_with_group_key` just
+        // wrote the new FGK row to — BEFORE `finalize()` below consumes it.
+        // Ground truth for tagging surviving scoped members' re-deliveries
+        // (no "current + 1" guesswork).
+        let new_epoch = TreeSpaceKey::<DefaultProver>::live_chain_current_epoch(&rekey_builder)
+            .await
+            .map_err(|_| {
+                SdkError::ValidationError("failed to resolve new rekey epoch".to_string())
+            })?;
         let rekey_output = rekey_builder.finalize();
         let mut retention_writes = rekey_output.writes;
         let retention_proofs = rekey_output.proofs;
@@ -99,8 +111,9 @@ impl Space {
         //     signed Rekey op (guest-validated); deliveries + proofs ride in the
         //     rekey request (server-verified, then re-deposited as fresh
         //     ScopedDeliveryEnvelopes). A standalone rekey removes no one.
-        let (scoped_regrants, grant_writes) =
-            self.build_scoped_regrants(&new_group_key, None).await?;
+        let (scoped_regrants, grant_writes) = self
+            .build_scoped_regrants(&new_group_key, new_epoch, None)
+            .await?;
         rekey_request.scoped_regrants = scoped_regrants;
         retention_writes.extend(grant_writes);
 
