@@ -42,10 +42,14 @@ pub struct TreeSpaceKey<P: SimpleLine2RuntimeProver = DefaultProver> {
     /// Group-key tier (§4.2): group key + temporal chain + rekey. `Some` for a
     /// full member (which derives every channel); `None` for a scoped member.
     group: Option<SimpleLine2SpaceKey<P>>,
-    /// Delivered channel subtree keys (§4.3) — the channels a scoped member may
-    /// read. Empty for a full member (it derives channels from `group`).
+    /// Delivered channel subtree keys (§4.3) — the channels (and epochs) a
+    /// scoped member may read, keyed by `(channel, epoch)` so a rekey that
+    /// re-derives a channel's key does not evict the still-valid key for a
+    /// prior epoch's rows (a scoped member retains read access to history it
+    /// was already granted). Empty for a full member (it derives channels
+    /// from `group`, walking whichever epoch it needs).
     #[serde(default)]
-    channel_keys: HashMap<i64, KeyMaterial>,
+    channel_keys: HashMap<(i64, u64), KeyMaterial>,
 }
 
 impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
@@ -57,9 +61,11 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         })
     }
 
-    /// Construct a **scoped** member holding only the given channel keys (no
-    /// group key). Reads are cryptographically limited to these channels.
-    pub fn scoped(channel_keys: impl IntoIterator<Item = (i64, KeyMaterial)>) -> Self {
+    /// Construct a **scoped** member holding only the given `(channel, epoch)`
+    /// keys (no group key). Reads are cryptographically limited to these
+    /// channels, and within a channel, to the epochs whose keys were
+    /// delivered.
+    pub fn scoped(channel_keys: impl IntoIterator<Item = ((i64, u64), KeyMaterial)>) -> Self {
         Self {
             group: None,
             channel_keys: channel_keys.into_iter().collect(),
@@ -71,9 +77,14 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         self.group.is_some()
     }
 
-    /// The explicit channel set a scoped member holds (empty for a full member).
+    /// The explicit channel set a scoped member holds (empty for a full
+    /// member) — distinct channels, collapsing multiple retained epochs of
+    /// the same channel into one entry.
     pub fn scoped_channels(&self) -> Vec<i64> {
-        self.channel_keys.keys().copied().collect()
+        let mut channels: Vec<i64> = self.channel_keys.keys().map(|(c, _)| *c).collect();
+        channels.sort_unstable();
+        channels.dedup();
+        channels
     }
 
     /// Derive a channel's subtree key from the current group key, for delivery
@@ -134,14 +145,19 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         Some((channel_key, proof))
     }
 
-    /// Install a delivered channel subtree key (scoped grant).
-    pub fn install_channel_key(&mut self, channel: i64, key: KeyMaterial) {
-        self.channel_keys.insert(channel, key);
+    /// Install a delivered channel subtree key for a specific epoch (scoped
+    /// grant). Retains any other epochs already held for this (or other)
+    /// channels — a rekey's re-delivery must not evict a still-valid prior
+    /// epoch's key out from under this member.
+    pub fn install_channel_key(&mut self, channel: i64, epoch: u64, key: KeyMaterial) {
+        self.channel_keys.insert((channel, epoch), key);
     }
 
-    /// Drop a channel subtree key — read revocation for this member.
+    /// Drop a channel subtree key — read revocation for this member. Removes
+    /// ALL epochs held for `channel` (revocation must not leave a stale
+    /// epoch's key behind as a back door).
     pub fn drop_channel_key(&mut self, channel: i64) {
-        self.channel_keys.remove(&channel);
+        self.channel_keys.retain(|(c, _), _| *c != channel);
     }
 
     fn group_ref(&self) -> Result<&SimpleLine2SpaceKey<P>, KeyManagerError> {
@@ -191,7 +207,7 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> SpaceKey for TreeSpaceKey<P> {
         let subtree = if let Some(g) = &self.group {
             let _ = reader; // group-key derivation needs no reader
             channel_root(&g.current_group_key(), key_id.channel)
-        } else if let Some(k) = self.channel_keys.get(&key_id.channel) {
+        } else if let Some(k) = self.channel_keys.get(&(key_id.channel, key_id.seq)) {
             k.clone()
         } else {
             return Err(KeyManagerError);
@@ -342,7 +358,7 @@ mod tests {
 
         // Full member derives channel 1's subtree key and "delivers" it.
         let ch1_key = full.channel_subtree_key(1).unwrap();
-        let scoped: Tree = TreeSpaceKey::scoped([(1, ch1_key)]);
+        let scoped: Tree = TreeSpaceKey::scoped([((1, 0), ch1_key)]);
 
         // Scoped reads channel 1 with the SAME key the full member derives...
         let full_c1 = full.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.unwrap();
@@ -379,7 +395,7 @@ mod tests {
             PoseidonMve::<DefaultMkem>::decrypt(b_kp.secret(), &b_ct, req.commitment).unwrap();
 
         // B is a scoped member holding only the delivered channel-1 key.
-        let scoped: Tree = TreeSpaceKey::scoped([(1, delivered)]);
+        let scoped: Tree = TreeSpaceKey::scoped([((1, 0), delivered)]);
 
         // B derives the SAME channel-1 data key the full member derives...
         let full_c1 = full.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.unwrap();
@@ -394,10 +410,42 @@ mod tests {
         let mut mem = MemoryOperationBuilder::new();
         let full: Tree = TreeSpaceKey::new(&mut mem).await.unwrap();
         let ch1_key = full.channel_subtree_key(1).unwrap();
-        let mut scoped: Tree = TreeSpaceKey::scoped([(1, ch1_key)]);
+        let mut scoped: Tree = TreeSpaceKey::scoped([((1, 0), ch1_key)]);
 
         assert!(scoped.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.is_ok());
         scoped.drop_channel_key(1);
         assert!(scoped.data_key_for_key_id(&TreeKeyId::new(1, 0), &mem).await.is_err());
+    }
+
+    #[test]
+    fn scoped_channel_keys_are_epoch_indexed() {
+        let key_a = KeyMaterial::random();
+        let key_b = KeyMaterial::random();
+        let mut scoped: Tree =
+            TreeSpaceKey::scoped([((5, 1), key_a.clone()), ((5, 2), key_b.clone())]);
+
+        // Both epochs of channel 5 are independently retrievable.
+        assert_eq!(scoped.channel_keys.get(&(5, 1)), Some(&key_a));
+        assert_eq!(scoped.channel_keys.get(&(5, 2)), Some(&key_b));
+        // `scoped_channels` reports distinct channels, not distinct (channel, epoch) pairs.
+        assert_eq!(scoped.scoped_channels(), vec![5]);
+
+        // Dropping the channel removes ALL of its epochs, not just one.
+        scoped.drop_channel_key(5);
+        assert!(scoped.channel_keys.get(&(5, 1)).is_none());
+        assert!(scoped.channel_keys.get(&(5, 2)).is_none());
+        assert!(scoped.scoped_channels().is_empty());
+    }
+
+    #[test]
+    fn install_channel_key_retains_other_epochs() {
+        let key_a = KeyMaterial::random();
+        let key_b = KeyMaterial::random();
+        let mut scoped: Tree = TreeSpaceKey::scoped([((5, 1), key_a.clone())]);
+
+        scoped.install_channel_key(5, 2, key_b.clone());
+
+        assert_eq!(scoped.channel_keys.get(&(5, 1)), Some(&key_a));
+        assert_eq!(scoped.channel_keys.get(&(5, 2)), Some(&key_b));
     }
 }

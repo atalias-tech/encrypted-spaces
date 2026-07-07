@@ -795,7 +795,16 @@ impl Space {
             let ch = &channels[i];
             match km.decrypt_delivered_key(&ch.ciphertext, anchored) {
                 Ok(key) => {
-                    km.space_key_mut().install_channel_key(ch.channel, key);
+                    // TODO(Task 4 — epoch-indexed channel keys): `ScopedChannelDelivery`
+                    // does not yet carry the epoch (fgk_ordinal) this key was derived
+                    // at. Task 2 only made `install_channel_key` compile here with a
+                    // placeholder `0`; it does NOT yet retain a prior epoch's key
+                    // across a rekey — every install still overwrites slot (channel, 0)
+                    // exactly as the old single-epoch map did. Task 4 must add the real
+                    // epoch to the delivery payload and pass it through here so a
+                    // rekey's re-delivery lands at its own epoch instead of clobbering
+                    // epoch 0.
+                    km.space_key_mut().install_channel_key(ch.channel, 0, key);
                     installed += 1;
                 }
                 Err(_) => {
