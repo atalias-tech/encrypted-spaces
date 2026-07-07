@@ -396,6 +396,23 @@ impl Space {
         //    `binding_commitment` == `commit(subtree key)`, so the committed
         //    grant record is exactly the delivered key.
         let epoch_reader = self.retention_builder();
+        // Resolve the current epoch OUTSIDE the key_manager lock. This read
+        // goes through the retention reader, which lazily fast-forwards the
+        // changelog when this replica is behind -- and the fast-forward path
+        // re-locks key_manager, so resolving it *under* the lock re-enters the
+        // (async, single-threaded) mutex and deadlocks (the same hazard fixed
+        // in crypto.rs::channel_encryption_key). A scoped invite is
+        // full-member-only (channel_subtree_key below requires the group key),
+        // so the write epoch is the live chain's current FGK ordinal --
+        // identical for every channel, hence resolved once here rather than
+        // per channel inside the lock.
+        let current_epoch = TreeSpaceKey::<DefaultProver>::live_chain_current_epoch(&epoch_reader)
+            .await
+            .map_err(|_| {
+                SdkError::ValidationError(
+                    "failed to resolve current channel epoch for scoped invite".into(),
+                )
+            })?;
         let (scoped_request, grant_writes) = {
             let km = self.key_manager.lock().await;
             let tree = km.space_key();
@@ -409,18 +426,12 @@ impl Space {
                         "only a full member can issue a scoped invite".into(),
                     )
                 })?;
-                // The epoch `subtree` was just derived under (the CURRENT
-                // group key's FGK ordinal) — tags the delivery so the
-                // recipient installs at this exact epoch instead of
-                // inferring one locally (the epoch-indexed channel-keys fix).
-                let epoch = tree
-                    .current_channel_epoch(ch, &epoch_reader)
-                    .await
-                    .map_err(|_| {
-                        SdkError::ValidationError(
-                            "failed to resolve current channel epoch for scoped invite".into(),
-                        )
-                    })?;
+                // Tag the delivery with the epoch `subtree` was derived under
+                // (the current group key's FGK ordinal) so the recipient
+                // installs at this exact epoch instead of inferring one
+                // locally (the epoch-indexed channel-keys fix). Resolved once
+                // above, OUTSIDE the km lock — see `current_epoch`.
+                let epoch = current_epoch;
                 let commitment = derivation.commit(&subtree);
                 let grant_proof = tree.prove_channel_grant(ch).ok_or_else(|| {
                     SdkError::ValidationError(

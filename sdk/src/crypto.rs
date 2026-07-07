@@ -73,9 +73,12 @@ pub(crate) async fn channel_encryption_key(
     // member's join) -- and the fast-forward path itself re-locks
     // `key_manager`. Holding the (async, single-threaded) lock across those
     // reads re-enters it and deadlocks forever; deriving on a clone lets the
-    // fast-forward re-lock `key_manager` freely. No crypto is duplicated, and
-    // the snapshot is race-free: a member's own group / channel key material
-    // changes only when IT rekeys, never concurrently with its own write.
+    // fast-forward re-lock `key_manager` freely. No crypto is duplicated. The
+    // snapshot is fail-closed and self-healing under a concurrent rekey by
+    // another member: deriving from the pre-clone key material against a chain
+    // the reader just fast-forwarded fails the commitment check -> a transient
+    // "channel key derivation failed" that heals on retry, never a wrong-epoch
+    // key. (A member's own key material changes only on its own rekey.)
     let space_key = space.key_manager.lock().await.space_key().clone();
     let current_epoch = space_key
         .current_channel_epoch(channel, &builder)
@@ -207,8 +210,10 @@ pub(crate) async fn decrypt_table_rows(
     // replica is behind -- and the fast-forward path re-locks `key_manager`.
     // Holding it across the per-row resolver would re-enter the (async,
     // single-threaded) lock and deadlock; deriving on a clone avoids it (same
-    // reasoning as `channel_encryption_key`). Race-free: a member's own group /
-    // channel key material changes only when IT rekeys.
+    // reasoning as `channel_encryption_key`). Fail-closed under a concurrent
+    // rekey: a stale snapshot fails the commitment check → a transient
+    // MissingKey (row dropped this pass, reappears on the next read), never a
+    // wrong key.
     let space_key = space.key_manager.lock().await.space_key().clone();
     let builder = space.retention_builder();
     let resolver = |key_id: TreeKeyId| {
