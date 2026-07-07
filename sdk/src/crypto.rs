@@ -9,6 +9,7 @@ use encrypted_spaces_crypto::encryption::{
 };
 use encrypted_spaces_crypto::error::EncryptionError;
 use crate::TreeKeyId;
+use encrypted_spaces_key_manager::SpaceKey;
 use std::collections::HashMap;
 
 /// Convert a schema to a list of encrypted columns (those with `plaintext == false`).
@@ -64,14 +65,25 @@ pub(crate) async fn channel_encryption_key(
     channel: i64,
 ) -> Result<EncryptionKey> {
     let builder = space.retention_builder();
-    let km = space.key_manager.lock().await;
-    let current_epoch = km
-        .space_key()
+    // Snapshot the space key under a brief lock, then RELEASE `key_manager`
+    // before the storage reads below. `current_channel_epoch` and
+    // `data_key_for_key_id` resolve the live chain / group-key edges through
+    // the retention reader, which lazily fast-forwards the changelog when this
+    // replica is behind (e.g. writing a channel row before syncing another
+    // member's join) -- and the fast-forward path itself re-locks
+    // `key_manager`. Holding the (async, single-threaded) lock across those
+    // reads re-enters it and deadlocks forever; deriving on a clone lets the
+    // fast-forward re-lock `key_manager` freely. No crypto is duplicated, and
+    // the snapshot is race-free: a member's own group / channel key material
+    // changes only when IT rekeys, never concurrently with its own write.
+    let space_key = space.key_manager.lock().await.space_key().clone();
+    let current_epoch = space_key
         .current_channel_epoch(channel, &builder)
         .await
         .map_err(|_| SdkError::DecryptionError("current channel epoch failed".into()))?;
     let key_id = TreeKeyId::new(channel, current_epoch);
-    km.data_key_for_key_id(&key_id, &builder)
+    space_key
+        .data_key_for_key_id(&key_id, &builder)
         .await
         .map(|bytes| EncryptionKey::new(bytes, &key_id))
         .map_err(|_| SdkError::DecryptionError("channel key derivation failed".into()))
@@ -189,13 +201,22 @@ pub(crate) async fn decrypt_table_rows(
     if columns.is_empty() {
         return Ok(());
     }
-    let km = space.key_manager.lock().await;
+    // Snapshot the space key, then RELEASE `key_manager` before decrypting.
+    // A channel row resolves its data key via a group-key edge-walk through
+    // the retention reader, which lazily fast-forwards the changelog when this
+    // replica is behind -- and the fast-forward path re-locks `key_manager`.
+    // Holding it across the per-row resolver would re-enter the (async,
+    // single-threaded) lock and deadlock; deriving on a clone avoids it (same
+    // reasoning as `channel_encryption_key`). Race-free: a member's own group /
+    // channel key material changes only when IT rekeys.
+    let space_key = space.key_manager.lock().await.space_key().clone();
     let builder = space.retention_builder();
     let resolver = |key_id: TreeKeyId| {
-        let km = &km;
+        let space_key = &space_key;
         let builder = &builder;
         async move {
-            km.data_key_for_key_id(&key_id, builder)
+            space_key
+                .data_key_for_key_id(&key_id, builder)
                 .await
                 .map(|bytes| EncryptionKey::new(bytes, &key_id))
                 .map_err(|_| EncryptionError::MissingKey(format!("{key_id:?}").into_bytes()))
@@ -1934,6 +1955,220 @@ mod tests {
         assert!(
             agent_rows.iter().all(|m| m.channel_id == 1),
             "scoped member must NOT read the un-granted channel 5 (Part A boundary intact)"
+        );
+        Ok(())
+    }
+
+    // ── Task 5: invariant + regression gates ────────────────────────────
+    //
+    // Lock-in gates for the epoch-indexed channel-key fix (Tasks 1-4): they
+    // are expected to already PASS given the prior tasks' work, not
+    // RED->GREEN feature tests. `full_member_reads_pre_rekey_channel_row_after_two_rekeys`
+    // (added in Task 3, above) already covers "multi-rekey depth > 1"; the
+    // test below extends that one hop further for extra margin rather than
+    // duplicating it.
+
+    /// Task 5 gate 1 (multi-rekey depth), extended: a channel row written at
+    /// E1 must survive THREE rekeys (E1 -> E2 -> E3 -> E4), exercising
+    /// `group_key_at`'s edge-walk at depth 3 (one hop deeper than the
+    /// existing two-rekey gate `full_member_reads_pre_rekey_channel_row_after_two_rekeys`).
+    #[tokio::test]
+    async fn full_member_reads_pre_rekey_channel_row_after_three_rekeys() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (_transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "e1 secret depth3".into(),
+            })
+            .execute()
+            .await?;
+
+        alice.rekey().await?; // E1 -> E2
+        alice.rekey().await?; // E2 -> E3
+        alice.rekey().await?; // E3 -> E4
+
+        let rows: Vec<Msg> = alice.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "e1 secret depth3"),
+            "a channel row written at E1 must survive THREE rekeys \
+             (E1->E2->E3->E4), exercising the edge-walk at depth 3"
+        );
+        Ok(())
+    }
+
+    /// Task 5 gate 2 — the security-critical lock-in: a member REMOVED at an
+    /// E1 -> E2 rekey must not read the E2 channel row, and must obtain no
+    /// E2 key at all. Guards against the historical-read fix (Tasks 1-4,
+    /// which retain PAST epochs' channel keys for present members)
+    /// accidentally reopening the §8 rekey-leak exclusion
+    /// (`sdk::users::build_scoped_regrants`'s `removed_uid` filter, "Part
+    /// A").
+    ///
+    /// The channel row under test is written at a NON-GENESIS epoch (E1,
+    /// after one standalone rekey) — carried forward from the Task 3
+    /// review. This exercises the write-side epoch stamp
+    /// (`TreeSpaceKey::current_channel_epoch` / `SimpleLine2SpaceKey::current_epoch`)
+    /// against the live chain's NEWEST ordinal rather than the
+    /// accidentally-correct genesis 0: the security property under test is
+    /// exactly that a rekey landing right after a removal tags NEW writes
+    /// at the NEW epoch, so a removed member holding only an OLD epoch's
+    /// key cannot read them.
+    ///
+    /// Charlie (removed) and Dave (survivor) are both scoped to the SAME
+    /// channel, isolating "removal breaks access" from "channel-scope
+    /// mismatch breaks access" (a different, already-tested property).
+    #[tokio::test]
+    async fn removed_scoped_member_gets_no_new_epoch_channel_key() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // E(genesis) -> E1: a standalone rekey BEFORE anyone is invited, so
+        // the channel row below is written at a NON-GENESIS epoch.
+        alice.rekey().await?;
+
+        // Charlie (to be removed) and Dave (survivor), both scoped to
+        // channel 1 — granted at E1 (the current epoch at invite time).
+        let charlie_invite = alice.invite_user_scoped(&[1]).await?;
+        let charlie_uid = charlie_invite.id().expect("scoped invite carries a uid");
+        let charlie = crate::Space::join(transport.clone(), charlie_invite, schema()).await?;
+        charlie.register_table_schema(msgs_schema()?);
+
+        let dave_invite = alice.invite_user_scoped(&[1]).await?;
+        let dave = crate::Space::join(transport.clone(), dave_invite, schema()).await?;
+        dave.register_table_schema(msgs_schema()?);
+
+        // Write the channel row at E1 (non-genesis).
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "e1-secret".into(),
+            })
+            .execute()
+            .await?;
+
+        // Sanity: both scoped members read the E1 row before the removal rekey.
+        let charlie_before: Vec<Msg> = charlie.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            charlie_before.iter().any(|m| m.body == "e1-secret"),
+            "Charlie must read the E1 row before removal"
+        );
+        let dave_before: Vec<Msg> = dave.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            dave_before.iter().any(|m| m.body == "e1-secret"),
+            "Dave must read the E1 row before the rekey"
+        );
+
+        // Converge alice's `_users` cache on both members' post-join key
+        // rotations before building the removal rekey (same reasoning as
+        // the sibling §8 leak tests above).
+        alice.recover_via_fast_forward().await?;
+
+        // Remove Charlie: triggers the E1 -> E2 rekey. Part A's
+        // `build_scoped_regrants` must exclude Charlie from the re-grant
+        // bundle entirely (no channel-1 regrant at E2 for her).
+        alice.remove_user(charlie_uid).await?;
+
+        // Alice writes a NEW channel row AFTER removal, at the NEW epoch E2.
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "e2-secret".into(),
+            })
+            .execute()
+            .await?;
+
+        // Dave (still present) refreshes and reads the E2 row: proves the
+        // write side stamped the NEWEST epoch (E2), not genesis 0, and
+        // Dave's legitimate regrant reaches it.
+        dave.refresh_scoped_keys().await?;
+        let dave_after: Vec<Msg> = dave.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            dave_after.iter().any(|m| m.body == "e2-secret"),
+            "a still-present scoped member must read the NEW E2 channel row \
+             (proves the write side stamped the NEWEST epoch, not genesis 0)"
+        );
+
+        // THE security assertion: Charlie (removed) must NOT read the E2
+        // row -- a fresh, uncached read (`select().all()` always re-fetches
+        // and re-decrypts from ciphertext).
+        let charlie_after: Vec<Msg> = charlie.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            !charlie_after.iter().any(|m| m.body == "e2-secret"),
+            "SECURITY: a member REMOVED at the E1->E2 rekey must not read \
+             the new E2 channel row -- the historical-read fix must not \
+             leak a new epoch's key to a removed member"
+        );
+
+        // Mechanistic proof, not just behavioral: the server clears a
+        // removed user's delivery slot entirely on removal
+        // (`backend/server/src/db.rs`'s remove-member handler, step "Clear
+        // the removed user's delivery slot"), so there is no channel key of
+        // ANY epoch -- let alone E2 -- left for Charlie to fetch. This
+        // directly confirms Part A's removal-exclusion path (slot clearing
+        // + `build_scoped_regrants`'s `removed_uid` filter) still holds
+        // under the epoch-indexed channel-key fix.
+        let server = transport.server_state();
+        let slot = server.lock().await.get_delivery_slot(charlie_uid);
+        assert!(
+            slot.is_none(),
+            "SECURITY: a removed member's delivery slot must be cleared -- \
+             no channel key material of any epoch should remain fetchable"
+        );
+
+        Ok(())
+    }
+
+    /// Task 5 gate 3: the ROOT line (non-channel rows -- no `channel_id`
+    /// column) is untouched by the epoch-indexed CHANNEL key fix. It
+    /// already resolved historical reads via `resolve_d_key`'s pre-existing
+    /// edge-walk (the "root-line rows always survived" half of the original
+    /// design investigation's asymmetry -- see
+    /// `full_member_reads_pre_rekey_channel_row_after_rekey`'s doc comment).
+    /// A root-line row written before a rekey must still read after it,
+    /// unaffected by any of Tasks 1-4's channel-specific changes.
+    #[tokio::test]
+    async fn root_line_row_survives_rekey() -> Result<()> {
+        let (_transport, alice) = create_space().await?;
+        let notes = create_notes_table(&alice).await?;
+
+        notes
+            .insert(&SecretNote {
+                id: None,
+                title: "pre-rekey".into(),
+                body: "root line secret".into(),
+            })
+            .execute()
+            .await?;
+
+        alice.rekey().await?;
+
+        let rows: Vec<SecretNote> = notes.select().all().await?;
+        assert!(
+            rows.iter().any(|n| n.body == "root line secret"),
+            "a root-line (non-channel) row must still read after a rekey -- \
+             regression guard on the untouched resolve_d_key path"
         );
         Ok(())
     }
