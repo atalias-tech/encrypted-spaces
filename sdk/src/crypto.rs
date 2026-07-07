@@ -45,26 +45,32 @@ pub(crate) async fn current_encryption_key(space: &Space) -> Result<EncryptionKe
         .map_err(|_| SdkError::DecryptionError("missing key for current key_id".into()))
 }
 
-/// Sub-sequence for per-channel data keys. Fixed at 0: a channel's key is
-/// `derive(group key, channel)`, and epoch rotation is already carried by the
-/// group key inside that derivation — so the channel key needs no separate root
-/// sequence. Crucially, this means encrypting a channel row does NOT require the
-/// root line's `current_key_id`, which a **scoped** member (no group key) cannot
-/// obtain — letting scoped agents post to their channels, not only read them.
-const CHANNEL_SUBSEQ: u64 = 0;
-
 /// Derive the encryption key for a row in `channel` (L2 read scoping, whitepaper
-/// §4.3/§5.1): the channel's data key is derived from the group key and the
-/// channel — `TreeKeyId{channel, seq}` in the ciphertext header. A full member
-/// derives it from the group key; a member scoped away from `channel` cannot,
-/// so it can't read the row.
+/// §4.3/§5.1): the channel's data key is derived from the group key **at the
+/// current epoch** and the channel — `TreeKeyId{channel, seq}` in the
+/// ciphertext header, with `seq` stamped to the current epoch (the FGK
+/// ordinal) so the row stays readable-by-epoch across later rekeys (the
+/// root line's `resolve_d_key`/`group_key_at` edge-walk is the template).
+/// A full member derives it from the epoch's group key; a member scoped away
+/// from `channel` cannot, so it can't read the row.
+///
+/// Getting the current epoch does NOT require the root line's
+/// `current_key_id` — `TreeSpaceKey::current_channel_epoch` resolves it from
+/// storage directly for a full member, and from the newest delivered grant
+/// for a scoped member — so a **scoped** member (no group key) can still
+/// post to its own channels, not only read them.
 pub(crate) async fn channel_encryption_key(
     space: &Space,
     channel: i64,
 ) -> Result<EncryptionKey> {
     let builder = space.retention_builder();
     let km = space.key_manager.lock().await;
-    let key_id = TreeKeyId::new(channel, CHANNEL_SUBSEQ);
+    let current_epoch = km
+        .space_key()
+        .current_channel_epoch(channel, &builder)
+        .await
+        .map_err(|_| SdkError::DecryptionError("current channel epoch failed".into()))?;
+    let key_id = TreeKeyId::new(channel, current_epoch);
     km.data_key_for_key_id(&key_id, &builder)
         .await
         .map(|bytes| EncryptionKey::new(bytes, &key_id))
@@ -1035,6 +1041,99 @@ mod tests {
         Ok(())
     }
 
+    /// THE regression gate for epoch-indexed channel keys: the core defect
+    /// this branch fixes. A full member writes a channel row under epoch E1;
+    /// a rekey rotates the space to E2; the SAME still-present full member
+    /// does a FRESH read (a brand-new `select().all()`, not a cached
+    /// plaintext) and must still decrypt the E1 row.
+    ///
+    /// Pre-fix, channel keys ignored `TreeKeyId.seq` entirely — always
+    /// derived from `current_group_key()` — so the moment the rekey landed,
+    /// this row's key became unrecoverable and `data_key_for_key_id` errored,
+    /// silently dropping the row (`decrypt_table_rows`'s per-row `Result`
+    /// handling in `channel_encryption_key`'s module). That is the "0
+    /// pre-rekey channel rows, 1 pre-rekey root-line row" defect from the
+    /// design investigation (root-line rows always survived via
+    /// `resolve_d_key`'s edge-walk; channel rows never did) — asserted here
+    /// permanently so it can't regress.
+    #[tokio::test]
+    async fn full_member_reads_pre_rekey_channel_row_after_rekey() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (_transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        // Write a channel row under epoch E1 (the space's genesis epoch).
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "pre-rekey secret".into(),
+            })
+            .execute()
+            .await?;
+
+        // Rotate the group key: E1 -> E2. Alice remains present throughout.
+        alice.rekey().await?;
+
+        // A fresh read of the E1 row after the rekey: `select().all()` always
+        // re-fetches and re-decrypts from ciphertext (see `Table::all` ->
+        // `fetch_and_decrypt`), so this genuinely exercises cross-epoch
+        // `data_key_for_key_id` resolution, not a locally-cached plaintext.
+        let rows: Vec<Msg> = alice.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "pre-rekey secret"),
+            "a still-present full member must read a channel row written BEFORE \
+             a rekey, after the rekey — the row's key derives from the epoch it \
+             was written under (E1), not whatever the current epoch (E2) is"
+        );
+        Ok(())
+    }
+
+    /// Multi-rekey depth variant of the regression gate above: a channel row
+    /// written under E1 must still be recoverable after TWO rekeys
+    /// (E1 -> E2 -> E3), exercising `group_key_at`'s edge-walk at depth > 1
+    /// (not just one hop back from the current epoch).
+    #[tokio::test]
+    async fn full_member_reads_pre_rekey_channel_row_after_two_rekeys() -> Result<()> {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Msg {
+            id: Option<i64>,
+            channel_id: i64,
+            body: String,
+        }
+
+        let (_transport, alice) = create_space().await?;
+        alice.create_table(&msgs_schema()?).await?;
+
+        alice
+            .table::<Msg>("msgs")
+            .insert(&Msg {
+                id: None,
+                channel_id: 1,
+                body: "e1 secret".into(),
+            })
+            .execute()
+            .await?;
+
+        alice.rekey().await?; // E1 -> E2
+        alice.rekey().await?; // E2 -> E3
+
+        let rows: Vec<Msg> = alice.table::<Msg>("msgs").select().all().await?;
+        assert!(
+            rows.iter().any(|m| m.body == "e1 secret"),
+            "a channel row written at E1 must survive TWO rekeys (E1->E2->E3), \
+             exercising the edge-walk at depth > 1"
+        );
+        Ok(())
+    }
+
     /// L2 Part B CROWN JEWEL: a scoped member keeps reading NEW messages in its
     /// channel across a rekey. A rekey rotates the group key, so every channel's
     /// subtree key (`channel_root(group_key, channel)`) changes; without
@@ -1556,14 +1655,14 @@ mod tests {
     /// group-key delivery). And the Part A read boundary still holds: the scoped
     /// member cannot read a channel it was never granted.
     ///
-    /// NOTE on epochs: channel keys are `channel_root(current_group_key, ch)`
-    /// with a fixed sequence (`CHANNEL_SUBSEQ = 0`), so a rekey rotates every
-    /// channel key and PRE-rekey channel rows become undecryptable to EVERYONE —
-    /// full and scoped alike. That is the shipped L2 channel-key model
-    /// (`crypto::channel_encryption_key` / `TreeSpaceKey::data_key_for_key_id`),
-    /// predating and orthogonal to Part B, whose scope is forward access to NEW
-    /// messages. So this test asserts pre-rekey reads BEFORE the rekey and
-    /// post-rekey reads AFTER it, never cross-epoch channel reads.
+    /// NOTE on epochs: channel rows are epoch-indexed (`TreeKeyId.seq` stamps
+    /// the FGK ordinal at write time; a full member re-derives the row's
+    /// epoch's group key via `group_key_at`'s edge-walk — see
+    /// `full_member_reads_pre_rekey_channel_row_after_rekey` for the
+    /// dedicated cross-epoch regression test). This test still asserts
+    /// pre-rekey reads BEFORE the rekey and post-rekey reads AFTER it — not
+    /// because cross-epoch reads are impossible, but because this test's
+    /// purpose is Part B no-harm, not epoch recovery.
     ///
     /// TEETH: Bob reading the POST-rekey rows fails if Part B disturbed
     /// full-member group-key delivery (a full member that lost the new group key

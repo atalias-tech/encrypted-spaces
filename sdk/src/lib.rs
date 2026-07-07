@@ -786,6 +786,25 @@ impl Space {
             verified.push((i, anchored));
         }
 
+        // Epoch to tag installed keys with: the live chain's current FGK
+        // ordinal, read straight from the (plaintext) `_retention` bookkeeping
+        // — no group key needed (see `TreeSpaceKey::live_chain_current_epoch`).
+        // TODO(Task 4 — epoch-indexed channel keys): this infers "current"
+        // from storage at install time rather than a value carried explicitly
+        // on `ScopedChannelDelivery`; a recipient that skips several rekeys'
+        // worth of refreshes before installing could mis-tag a delivery with
+        // a too-new epoch. Thread the real epoch through the delivery payload
+        // to remove this race. Strictly more correct than the prior fixed
+        // placeholder `0` (which ignored the actual epoch entirely) for the
+        // common single-rekey-then-refresh case.
+        let epoch_reader = self.retention_builder();
+        let install_epoch =
+            TreeSpaceKey::<encrypted_spaces_retention::simple_line2::DefaultProver>::live_chain_current_epoch(
+                &epoch_reader,
+            )
+            .await
+            .unwrap_or(0);
+
         // Phase 2 (key-manager lock): decrypt against the ANCHORED commitment
         // (not the envelope's) and install. A ciphertext that does not decrypt
         // to the anchored key fails here and is skipped.
@@ -795,16 +814,8 @@ impl Space {
             let ch = &channels[i];
             match km.decrypt_delivered_key(&ch.ciphertext, anchored) {
                 Ok(key) => {
-                    // TODO(Task 4 — epoch-indexed channel keys): `ScopedChannelDelivery`
-                    // does not yet carry the epoch (fgk_ordinal) this key was derived
-                    // at. Task 2 only made `install_channel_key` compile here with a
-                    // placeholder `0`; it does NOT yet retain a prior epoch's key
-                    // across a rekey — every install still overwrites slot (channel, 0)
-                    // exactly as the old single-epoch map did. Task 4 must add the real
-                    // epoch to the delivery payload and pass it through here so a
-                    // rekey's re-delivery lands at its own epoch instead of clobbering
-                    // epoch 0.
-                    km.space_key_mut().install_channel_key(ch.channel, 0, key);
+                    km.space_key_mut()
+                        .install_channel_key(ch.channel, install_epoch, key);
                     installed += 1;
                 }
                 Err(_) => {

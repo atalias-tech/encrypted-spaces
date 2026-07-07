@@ -269,9 +269,9 @@ pub(crate) async fn resolve_d_key(
 /// each node's `older_gb_key_ciphertext` with `derive(&gb_key,
 /// tag(GB_CHAIN_LINK_TAG))`, until the node whose `fgk_ordinal` matches the
 /// target is reached, and returns that node's GB key.
-// No non-test caller yet: consumed by epoch-indexed channel-key resolution
-// (later tasks in this plan). Remove the allow when that lands.
-#[allow(dead_code)]
+///
+/// Called via [`SimpleLine2SpaceKey::group_key_at`], the epoch-indexed
+/// channel-key read path's full-member accessor.
 pub(crate) async fn group_key_at(
     local_hgk: &KeyMaterial,
     fgk_ordinal: u64,
@@ -766,6 +766,44 @@ impl<P: SimpleLine2RuntimeProver> SimpleLine2SpaceKey<P> {
     /// (channel) keys structurally, per §4.3/§5.1 (`derive(group key, path)`).
     pub fn current_group_key(&self) -> KeyMaterial {
         self.hgk.clone()
+    }
+
+    /// Recover the group key that covered epoch `fgk_ordinal` — the
+    /// full-member read-side accessor for epoch-indexed channel keys. Thin
+    /// wrapper over the module-level [`group_key_at`] using `self.hgk` as the
+    /// locally-held HGK, mirroring how [`Self::current_group_key`] exposes
+    /// `self.hgk` directly. `fgk_ordinal` is the SAME 0-indexed dense
+    /// ordinal [`Self::current_epoch`] stamps at write time — no off-by-one
+    /// between the two.
+    pub async fn group_key_at(
+        &self,
+        reader: &dyn OperationReader,
+        fgk_ordinal: u64,
+    ) -> Result<KeyMaterial, KeyManagerError> {
+        group_key_at(&self.hgk, fgk_ordinal, reader).await
+    }
+
+    /// The current epoch (FGK ordinal) — the write-side stamp for a
+    /// freshly-written channel row's `TreeKeyId.seq`, so that a later
+    /// [`Self::group_key_at`] call (at read time, possibly after further
+    /// rekeys) recovers the exact group key this row was encrypted under.
+    ///
+    /// Read fresh from storage on every call via [`reconstruct_live_chain`]
+    /// (the newest node's `fgk_ordinal`), not derived from `self.hgk` —
+    /// epoch identity is a storage-relative index (which rekey we're on),
+    /// not something the key material itself encodes. This is exactly the
+    /// ordinal `reconstruct_live_chain` places first (newest-to-oldest), and
+    /// the same ordinal `group_key_at`'s `node_index == 0` case resolves
+    /// with an empty edge-walk.
+    pub async fn current_epoch(
+        &self,
+        reader: &dyn OperationReader,
+    ) -> Result<u64, KeyManagerError> {
+        let chain = reconstruct_live_chain(reader).await?;
+        chain
+            .first()
+            .map(|node| node.fgk_ordinal)
+            .ok_or(KeyManagerError)
     }
 }
 impl<P: SimpleLine2RuntimeProver> SimpleLine2SpaceKey<P> {

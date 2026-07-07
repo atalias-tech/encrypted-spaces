@@ -29,8 +29,8 @@ use encrypted_spaces_key_manager::{
 use serde::{Deserialize, Serialize};
 
 use crate::simple_line2::{
-    ChannelGrantProofInput, ChannelGrantVerifyInput, DefaultDerivation, DefaultProver,
-    SimpleLine2RuntimeProver, SimpleLine2SpaceKey,
+    reconstruct_live_chain, ChannelGrantProofInput, ChannelGrantVerifyInput, DefaultDerivation,
+    DefaultProver, SimpleLine2RuntimeProver, SimpleLine2SpaceKey,
 };
 use crate::tree_keys::{channel_data_key, channel_root, TreeKeyId};
 
@@ -132,10 +132,14 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
     /// to a scoped member (§4.3). Full members only (`None` for a scoped member,
     /// which holds no group key).
     ///
-    /// Derived from the *current* group key (epoch). Reading a channel's data
-    /// written under a previous group key (before a rekey) requires recovering
-    /// that epoch's group key via the §4.2 encryption-edge chain — a tracked
-    /// follow-up; not needed within an epoch.
+    /// Derived from the *current* group key (epoch) only — this is the
+    /// delivery-time key handed to a scoped member for `channel`, not a
+    /// historical-read resolver. Full-member reads of a channel row written
+    /// under a PAST epoch instead recover that epoch's group key via
+    /// `SimpleLine2SpaceKey::group_key_at`'s §4.2 encryption-edge walk
+    /// (`TreeSpaceKey::data_key_for_key_id`). Delivering a scoped member's
+    /// PAST epochs (so it retains history across a rekey, not just the
+    /// current grant) is a separate, tracked follow-up.
     pub fn channel_subtree_key(&self, channel: i64) -> Option<KeyMaterial> {
         self.group
             .as_ref()
@@ -201,6 +205,71 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
         self.channel_keys.retain(|(c, _), _| *c != channel);
     }
 
+    /// The epoch to stamp into a freshly-written channel row's
+    /// `TreeKeyId.seq` (the write-side counterpart to
+    /// [`SpaceKey::data_key_for_key_id`]'s epoch-indexed read): so a row
+    /// encrypted now is tagged with the epoch its key actually derives from,
+    /// and stays readable by epoch after later rekeys.
+    ///
+    /// Full member: the live chain's current FGK ordinal
+    /// ([`SimpleLine2SpaceKey::current_epoch`]), read fresh from storage.
+    /// Scoped member: it holds no group key and cannot resolve a storage
+    /// epoch notion directly, so it stamps the newest epoch it has been
+    /// delivered a key for on `channel` — the freshest grant is its best
+    /// local approximation of "current" (§4.1 mVE re-delivery keeps this
+    /// current across rekeys). No delivered key for `channel` ⇒
+    /// `KeyManagerError` (cannot write to a channel it was never granted —
+    /// the write-side mirror of the read-scoping boundary).
+    pub async fn current_channel_epoch(
+        &self,
+        channel: i64,
+        reader: &dyn OperationReader,
+    ) -> Result<u64, KeyManagerError> {
+        if let Some(g) = &self.group {
+            g.current_epoch(reader).await
+        } else {
+            self.channel_keys
+                .keys()
+                .filter(|(c, _)| *c == channel)
+                .map(|&(_, epoch)| epoch)
+                .max()
+                .ok_or(KeyManagerError)
+        }
+    }
+
+    /// The live chain's current epoch (FGK ordinal), read directly from
+    /// storage — no `self` state needed. Unlike [`Self::current_channel_epoch`]
+    /// (the *write-time* accessor, which for a scoped member instead reports
+    /// the newest epoch it already holds, since it has no other way to name
+    /// "current"), this works for ANY member, full or scoped: the
+    /// `_retention` FGK/D bookkeeping backing the live chain is plaintext
+    /// (`internal_schemas.kdl`), not gated behind the group key.
+    ///
+    /// Used at delivery-*install* time: a scoped member tags a
+    /// freshly-delivered channel key with the epoch it was derived under
+    /// (`sdk`'s `install_scoped_channels_verified`), so a later read's
+    /// `(channel, epoch)` lookup matches what a full member independently
+    /// stamps via [`SimpleLine2SpaceKey::current_epoch`] at write time.
+    ///
+    /// INTERIM caveat: this infers "current" from storage NOW rather than
+    /// from a value carried explicitly on the delivery payload. A recipient
+    /// that installs after MULTIPLE further rekeys landed (having skipped
+    /// intermediate `refresh_scoped_keys` calls) could mis-tag a delivery
+    /// with a too-new epoch. Tracked follow-up: thread the real epoch
+    /// through `ScopedChannelDelivery` itself to remove this race. Not a
+    /// regression versus the prior placeholder (every install used the
+    /// fixed epoch 0 regardless of the delivery's actual epoch); strictly
+    /// more correct for the common single-rekey-then-refresh case.
+    pub async fn live_chain_current_epoch(
+        reader: &dyn OperationReader,
+    ) -> Result<u64, KeyManagerError> {
+        let chain = reconstruct_live_chain(reader).await?;
+        chain
+            .first()
+            .map(|node| node.fgk_ordinal)
+            .ok_or(KeyManagerError)
+    }
+
     fn group_ref(&self) -> Result<&SimpleLine2SpaceKey<P>, KeyManagerError> {
         self.group.as_ref().ok_or(KeyManagerError)
     }
@@ -243,11 +312,13 @@ impl<P: SimpleLine2RuntimeProver + Send + Sync> SpaceKey for TreeSpaceKey<P> {
                 .await;
         }
         // Channel row: derive the AES data key from the channel's subtree key —
-        // which a full member derives from the group key, and a scoped member
-        // holds directly (delivered). Out of scope ⇒ error (→ MissingKey).
+        // which a full member derives from the EPOCH's group key (`key_id.seq`,
+        // recovered via the §4.2 encryption-edge walk — symmetric with the root
+        // line), and a scoped member holds directly per `(channel, epoch)`
+        // (delivered). Out of scope ⇒ error (→ MissingKey).
         let subtree = if let Some(g) = &self.group {
-            let _ = reader; // group-key derivation needs no reader
-            channel_root(&g.current_group_key(), key_id.channel)
+            let gk = g.group_key_at(reader, key_id.seq).await?;
+            channel_root(&gk, key_id.channel)
         } else if let Some(k) = self.channel_keys.get(&(key_id.channel, key_id.seq)) {
             k.clone()
         } else {
