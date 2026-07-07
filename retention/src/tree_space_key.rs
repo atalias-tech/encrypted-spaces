@@ -48,8 +48,49 @@ pub struct TreeSpaceKey<P: SimpleLine2RuntimeProver = DefaultProver> {
     /// prior epoch's rows (a scoped member retains read access to history it
     /// was already granted). Empty for a full member (it derives channels
     /// from `group`, walking whichever epoch it needs).
-    #[serde(default)]
+    ///
+    /// `#[serde(with = "channel_keys_serde")]`: `serde_json` only allows
+    /// primitive (int/string/bool/char) map keys, so the tuple key
+    /// `(i64, u64)` cannot be serialized as a JSON object key directly — this
+    /// is exactly the snapshot/restore persistence path (`KeyManager` /
+    /// `Space::snapshot()` / `Space::restore()`), which any scoped member
+    /// (e.g. an L2 agent) with >=1 delivered channel key hits. Instead we
+    /// (de)serialize the map as a `Vec<((i64, u64), KeyMaterial)>` — a JSON
+    /// *array*, where the tuple is a sequence element (fine for serde_json),
+    /// not a map key.
+    #[serde(default, with = "channel_keys_serde")]
     channel_keys: HashMap<(i64, u64), KeyMaterial>,
+}
+
+/// (De)serializes `HashMap<(i64, u64), KeyMaterial>` as a JSON array of
+/// `((i64, u64), KeyMaterial)` pairs, since `serde_json` cannot use a tuple
+/// as a map key. See the `channel_keys` field doc for why this exists.
+mod channel_keys_serde {
+    use std::collections::HashMap;
+
+    use encrypted_spaces_crypto::KeyMaterial;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(
+        map: &HashMap<(i64, u64), KeyMaterial>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries: Vec<(&(i64, u64), &KeyMaterial)> = map.iter().collect();
+        entries.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<(i64, u64), KeyMaterial>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<((i64, u64), KeyMaterial)>::deserialize(deserializer)?;
+        Ok(entries.into_iter().collect())
+    }
 }
 
 impl<P: SimpleLine2RuntimeProver + Send + Sync> TreeSpaceKey<P> {
@@ -447,5 +488,30 @@ mod tests {
 
         assert_eq!(scoped.channel_keys.get(&(5, 1)), Some(&key_a));
         assert_eq!(scoped.channel_keys.get(&(5, 2)), Some(&key_b));
+    }
+
+    /// Regression: `channel_keys` is keyed by the tuple `(i64, u64)`, which
+    /// `serde_json` cannot use as a map key (only primitives — int/string/
+    /// bool/char — are allowed as JSON object keys). A scoped member with
+    /// >=1 delivered channel key must still round-trip through
+    /// `serde_json`, since that's exactly the snapshot/restore persistence
+    /// path (`KeyManager` / `Space::snapshot()` / `Space::restore()`).
+    /// Pre-fix this fails with `Error("key must be a string")`; post-fix it
+    /// round-trips both epochs.
+    #[test]
+    fn scoped_channel_keys_serde_json_round_trip() {
+        let key_a = KeyMaterial::random();
+        let key_b = KeyMaterial::random();
+        let scoped: Tree =
+            TreeSpaceKey::scoped([((5i64, 1u64), key_a.clone()), ((5, 2), key_b.clone())]);
+
+        let json = serde_json::to_value(&scoped)
+            .expect("scoped TreeSpaceKey must serialize to JSON (snapshot path)");
+        let restored: Tree = serde_json::from_value(json)
+            .expect("scoped TreeSpaceKey must deserialize from JSON (restore path)");
+
+        assert_eq!(restored.channel_keys.get(&(5, 1)), Some(&key_a));
+        assert_eq!(restored.channel_keys.get(&(5, 2)), Some(&key_b));
+        assert_eq!(restored.scoped_channels(), vec![5]);
     }
 }
